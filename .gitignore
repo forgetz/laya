@@ -55,6 +55,8 @@ docs/superpowers/
 # credentials - never commit
 .env
 .env.*
+# ...but the template carries no secrets and has to be committed
+!.env.example
 *.pypirc
 .pypirc
 *.token
