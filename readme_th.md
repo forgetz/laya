@@ -20,9 +20,10 @@ Laya เป็น **decision engine แบบ non-autoregressive** ตอบค�
 8. [อ่านผลลัพธ์](#8-อ่านผลลัพธ์)
 9. [Error และ limit](#9-error-และ-limit)
 10. [ตัวแปรตั้งค่า](#10-ตัวแปรตั้งค่า)
-11. [ถ้ามี NVIDIA GPU](#11-ถ้ามี-nvidia-gpu)
-12. [แก้ปัญหา](#12-แก้ปัญหา)
-13. [คำสั่งที่ใช้บ่อย](#13-คำสั่งที่ใช้บ่อย)
+11. [รันแบบ offline](#11-รันแบบ-offline)
+12. [ถ้ามี NVIDIA GPU](#12-ถ้ามี-nvidia-gpu)
+13. [แก้ปัญหา](#13-แก้ปัญหา)
+14. [คำสั่งที่ใช้บ่อย](#14-คำสั่งที่ใช้บ่อย)
 
 ---
 
@@ -35,7 +36,7 @@ Laya เป็น **decision engine แบบ non-autoregressive** ตอบค�
 
 **เรื่อง GPU:** ถ้าไม่มี NVIDIA GPU (เช่นมีแค่ Intel Iris Xe / AMD / Apple) ให้ใช้ CPU ตามเอกสารนี้
 Apple MPS, AMD/ROCm และ Intel GPU **ใช้ใน container ไม่ได้** ต้องมี NVIDIA + NVIDIA Container Toolkit
-เท่านั้น ดู [ข้อ 11](#11-ถ้ามี-nvidia-gpu)
+เท่านั้น ดู [ข้อ 12](#12-ถ้ามี-nvidia-gpu)
 
 เช็คว่าพร้อม:
 
@@ -456,7 +457,8 @@ docker compose -f compose.yaml -f compose.http.yaml logs --tail 50 laya-serve
 | `LAYA_MAX_LOADED` | `2` | จำนวน checkpoint ใน memory พร้อมกัน — ตั้ง `3` ถ้าเปิด `LAYA_AUTO_TASK` ไม่งั้นจะ reload ทุกครั้งที่สลับ |
 | `LAYA_CUDA_AMP` / `LAYA_CPU_AMP` | ไม่ตั้ง | `fp16`/`bf16` — ว่างไว้ = ใช้ `amp_dtype` ของ checkpoint |
 | `HF_TOKEN` / `_FILE` | ไม่ตั้ง | credential Hugging Face (checkpoint public ไม่ต้องใช้) |
-| `HF_HUB_OFFLINE` | `0` | `1` = ใช้แต่ของที่ cache แล้ว |
+| `HF_HUB_OFFLINE` | `0` | `1` = ใช้แต่ของที่ cache แล้ว ไม่ยิงไป Hub เลย |
+| `LAYA_WEIGHTS_PATH` | ไม่ตั้ง | **`compose.offline.yaml` เท่านั้น** — directory ที่มี `convaiinnovations/` อยู่ข้างใน ดู [ข้อ 11](#11-รันแบบ-offline) |
 | `LAYA_TORCH_INDEX` | `cpu` | **build arg** — `cpu` / `cu128` / `cu130` |
 
 > `LAYA_TORCH_INDEX` เป็น **build arg** ไม่ใช่ runtime — สลับ CPU ↔ CUDA ด้วย `-e` ไม่ได้ ต้อง rebuild
@@ -465,7 +467,130 @@ docker compose -f compose.yaml -f compose.http.yaml logs --tail 50 laya-serve
 
 ---
 
-## 11. ถ้ามี NVIDIA GPU
+## 11. รันแบบ offline
+
+เครื่องที่รันไม่ต้องต่อเน็ตเลย แต่ต้องต่อ **2 ครั้งก่อน** เพื่อเตรียมของ: ครั้งแรกตอน build image
+([ข้อ 2](#2-ติดตั้ง-build-image)) ครั้งที่สองตอนโหลด checkpoint ตามข้างล่างนี้
+
+วิธีนี้ไม่ใช้ Hugging Face cache — วาง checkpoint เป็น **directory ธรรมดา** แล้ว bind mount เข้าไป
+เพราะ `Agent.__init__` จะเช็คก่อนว่า model spec ตรงกับ directory ที่มีอยู่จริงไหม ถ้าตรงก็ใช้เลย
+ไม่แตะ Hub จึงไม่ต้องไปสร้างโครง `refs/` `snapshots/` `blobs/` ของ cache ให้ถูกเองซึ่งพลาดง่าย
+
+### 11.1 เตรียมไฟล์ (เครื่องที่มีเน็ต)
+
+```bash
+python scripts/fetch_offline_checkpoints.py --out ./weights
+```
+
+โหลด `english` + `multilingual` เฉพาะ 4 อย่างที่ตัวโหลดเปิดอ่านจริง ไม่ดึง `typed-decisions` ติดมา
+ถ้าอยากได้ครบสามตัวใส่ `--models english,multilingual,typed-decisions`
+
+ได้โครงนี้ (ถ้าจะโหลดมือจากหน้าเว็บ `huggingface.co/convaiinnovations/laya` ก็จัดให้ตรงแบบนี้):
+
+```
+weights/convaiinnovations/laya/
+├── rl_agent_config.json
+├── model.safetensors
+├── tokenizer/           ← tokenizer.json, tokenizer_config.json
+├── encoder/             ← config.json
+└── multilingual/
+    ├── rl_agent_config.json
+    ├── model.safetensors
+    ├── tokenizer/
+    └── encoder/
+```
+
+> **`encoder/` ขาดไม่ได้** — ถ้าไม่มี `build_model()` จะ fallback ไปโหลด base encoder
+> (ModernBERT / mmBERT) จาก Hub ทำให้ยังต้องใช้เน็ตอยู่ทั้งที่ไฟล์อื่นครบแล้ว
+
+สคริปต์จะทิ้ง `.cache/huggingface/` ไว้ในโครงด้วย เป็น metadata สำหรับ resume ตอน re-run
+runtime ไม่ได้อ่าน ลบทิ้งก่อนคัดลอกได้
+
+### 11.2 ย้ายไปเครื่อง offline
+
+```bash
+# เครื่องที่มีเน็ต
+docker save laya-laya-serve:latest | gzip > laya-serve.tar.gz
+tar czf laya-weights.tar.gz weights/
+
+# เครื่อง offline
+gunzip -c laya-serve.tar.gz | docker load
+tar xzf laya-weights.tar.gz
+python scripts/fetch_offline_checkpoints.py --out ./weights --verify   # ไม่ใช้เน็ต
+```
+
+`--verify` บอกเป็นรายไฟล์ว่าอะไรขาด และคืน exit code 1 ถ้าไม่ครบ ใช้ใน CI ได้
+
+### 11.3 รัน
+
+```bash
+LAYA_WEIGHTS_PATH=./weights docker compose \
+  -f compose.yaml -f compose.http.yaml -f compose.offline.yaml up -d --wait laya-serve
+```
+
+`LAYA_WEIGHTS_PATH` ชี้ไปที่ directory ที่ **มี `convaiinnovations/` อยู่ข้างใน** (คือ `./weights`)
+ไม่ใช่ตัว `convaiinnovations/` เอง
+
+one-shot ใช้ไฟล์ชุดเดิมทั้งสาม แค่เปลี่ยน service:
+
+```bash
+LAYA_WEIGHTS_PATH=./weights docker compose \
+  -f compose.yaml -f compose.http.yaml -f compose.offline.yaml run --rm laya
+```
+
+> ต้องใส่ `compose.http.yaml` ด้วย**ทุกครั้ง** แม้จะรัน one-shot เพราะ `compose.offline.yaml`
+> override service `laya-serve` และมีแต่ `compose.http.yaml` ที่ให้ build context กับ service นั้น
+> ถ้าขาดไป Compose จะปฏิเสธทั้ง project:
+> `service "laya-serve" has neither an image nor a build context specified`
+
+GPU ต่อ `-f compose.cuda.yaml` ไว้ท้ายสุด
+
+`compose.offline.yaml` ตั้งให้เองแล้ว 3 อย่าง:
+
+| ตัวแปร | ค่า | ทำไม |
+|---|---|---|
+| `HF_HUB_OFFLINE` | `1` | ตัดทุก request ไป Hub รวมถึงการเช็ค revision ที่ทำทุกครั้งที่สร้าง Agent — ไฟล์ขาดจะ error ทันที ไม่แขวนรอ timeout |
+| `LAYA_PRELOAD` | `1` | โหลดทั้งสอง checkpoint **ก่อน** bind port ไฟล์ขาดจะทำให้ `up --wait` fail ไม่ใช่ไปพังตอนคำขอแรกของลูกค้า |
+| `LAYA_MODELS` | `english,multilingual` | ต้องตรงกับที่ mount ไว้ ถ้าปล่อยว่างจะ preload ทั้งตระกูลรวม `typed-decisions` ที่ไม่ได้โหลดมา |
+
+### 11.4 ตรวจสอบ
+
+```bash
+curl -s localhost:8000/health
+```
+
+```
+{"status":"ok","loaded":["english","multilingual"],"device":"cpu", ...}
+```
+
+`loaded` ต้องมีครบทั้งสองตัวตั้งแต่คำขอแรก เพราะ preload แล้ว
+
+### 11.5 กับดัก
+
+**mount เป็น `:ro`** — `compose.offline.yaml` ตั้งไว้แบบนี้ และใช้ได้กับ checkpoint ที่ publish อยู่
+(revision `55cf4c4e` ทั้งสองตัวประกาศ `tokenizer_class: PreTrainedTokenizerFast` และ
+`extra_special_tokens` เป็น dict อยู่แล้ว จึงไม่มีอะไรต้องแก้) แต่ถ้าเจอ warning
+`laya: could not patch .../tokenizer_config.json` ใน log ให้ถอด `:ro` ออก — แปลว่า checkpoint
+นั้นต้องการการแก้ไฟล์จริง และบน mount read-only มันจะเตือนเฉย ๆ แล้วไปพังที่ `AutoTokenizer`
+ด้วย error ที่ไม่บอกสาเหตุ (`'list' object has no attribute 'keys'`)
+
+**permission** — container รันเป็น UID 10001 ไฟล์ต้องอ่านได้:
+```bash
+chmod -R a+rX weights/            # หรือ chown -R 10001:10001 weights/
+```
+
+**`LAYA_MODEL_PATH` ใช้กับ `laya-serve` ไม่ได้** — มีแต่โหมด one-shot ที่อ่าน ส่วน `laya-serve`
+สร้าง Router จาก `LAYA_DEVICE` / `LAYA_MODELS` / `LAYA_PRELOAD` / `LAYA_AUTO_TASK` /
+`LAYA_MAX_LOADED` เท่านั้น ไม่มี env ไหนชี้ path ได้ — นั่นคือเหตุผลที่ต้องใช้ bind mount
+
+**`LAYA_REVISION`** — ไม่ต้องตั้ง ไม่มีผลกับวิธีนี้เพราะไม่ได้ผ่าน `snapshot_download` เลย
+ถ้าจะ pin ให้ใส่ที่สคริปต์ตอนโหลดแทน: `--revision <sha>`
+
+**rebuild image ยังต้องต่อเน็ต** — torch wheel + PyPI เก็บ `laya-serve.tar.gz` ไว้ หรือทำ local mirror
+
+---
+
+## 12. ถ้ามี NVIDIA GPU
 
 ต้องมี driver NVIDIA ที่เข้ากันได้ + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 image GPU ใช้ PyTorch CUDA 12.8 (บน Windows ต้องตั้ง WSL2 GPU ของ Docker Desktop ให้เรียบร้อย)
@@ -493,7 +618,7 @@ docker compose -f compose.yaml -f compose.cuda.yaml run --rm laya python -c \
 
 ---
 
-## 12. แก้ปัญหา
+## 13. แก้ปัญหา
 
 **คำขอแรกช้ามาก (หลายนาที)** — ปกติ กำลังดาวน์โหลด checkpoint รอบต่อไปจะเร็ว
 weights เก็บใน volume ชื่อ `laya_model-cache`
@@ -532,7 +657,7 @@ docker volume rm laya_model-cache
 
 ---
 
-## 13. คำสั่งที่ใช้บ่อย
+## 14. คำสั่งที่ใช้บ่อย
 
 ```bash
 # build / rebuild หลัง git pull
@@ -546,6 +671,12 @@ docker compose -f compose.yaml -f compose.http.yaml up -d --wait laya-serve
 docker compose -f compose.yaml -f compose.http.yaml ps
 docker compose -f compose.yaml -f compose.http.yaml logs -f laya-serve
 docker compose -f compose.yaml -f compose.http.yaml down
+
+# offline (ดูข้อ 11)
+python scripts/fetch_offline_checkpoints.py --out ./weights          # เครื่องที่มีเน็ต
+python scripts/fetch_offline_checkpoints.py --out ./weights --verify # เครื่อง offline
+LAYA_WEIGHTS_PATH=./weights docker compose \
+  -f compose.yaml -f compose.http.yaml -f compose.offline.yaml up -d --wait laya-serve
 
 # ทดสอบ
 curl -s localhost:8000/health

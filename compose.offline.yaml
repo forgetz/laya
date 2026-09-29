@@ -1,0 +1,66 @@
+# Serve `english` and `multilingual` from checkpoint files on disk, with every Hub request
+# disabled. Use with compose.yaml and compose.http.yaml:
+#
+#   LAYA_WEIGHTS_PATH=./weights docker compose \
+#     -f compose.yaml -f compose.http.yaml -f compose.offline.yaml up -d --wait laya-serve
+#
+# Populate that directory first, on a host that has network access:
+#
+#   python scripts/fetch_offline_checkpoints.py --out ./weights
+#
+# LAYA_WEIGHTS_PATH names the directory that *contains* `convaiinnovations/`, which is what
+# the script writes and what the mount below appends.
+#
+# For NVIDIA, append -f compose.cuda.yaml after this file. One-shot takes the same three files
+# and selects the other service:
+#
+#   LAYA_WEIGHTS_PATH=./weights docker compose \
+#     -f compose.yaml -f compose.http.yaml -f compose.offline.yaml run --rm laya
+#
+# compose.http.yaml has to stay in the list even for the one-shot service, because this file
+# overrides `laya-serve` and only compose.http.yaml gives that service a build context;
+# without it Compose rejects the project ("neither an image nor a build context specified").
+#
+# Why a bind mount rather than a warmed Hub cache: `Agent.__init__` resolves a model spec that
+# names an existing directory before it considers a download, and the container's working
+# directory is /home/laya. Mounting the tree at /home/laya/convaiinnovations therefore makes
+# `convaiinnovations/laya` -- and the `multilingual` subfolder the Router asks for -- resolve to
+# real files, with no cache layout (refs/, snapshots/, blobs/) to reproduce by hand. The named
+# `model-cache` volume the base files declare stays mounted and simply goes unused.
+services:
+  laya-serve:
+    environment:
+      # No Hub request of any kind, including the revision lookup `snapshot_download` performs
+      # on every Agent build. A checkpoint that is not on disk then fails immediately with
+      # LocalEntryNotFoundError instead of waiting out a connection timeout.
+      HF_HUB_OFFLINE: "1"
+      # Build both checkpoints before the port is bound, so an incomplete mount fails
+      # `up --wait` rather than the first request that happens to need the missing one.
+      LAYA_PRELOAD: "1"
+      # Must name checkpoints the mount actually carries. An empty value would preload the
+      # whole family, `typed-decisions` included, which this tree does not hold by default.
+      LAYA_MODELS: "${LAYA_MODELS:-english,multilingual}"
+    volumes:
+      # Read-only, which the published checkpoints allow: `_fix_tokenizer_config()` rewrites
+      # <checkpoint>/tokenizer/tokenizer_config.json only when `tokenizer_class` is unset or
+      # `extra_special_tokens` is a list, and at revision 55cf4c4e neither `english` nor
+      # `multilingual` is (both declare PreTrainedTokenizerFast, and the multilingual mmBERT
+      # config already stores a mapping). `scripts/fetch_offline_checkpoints.py` applies the
+      # same normalisation up front, so a tree it produced never needs the server to write.
+      #
+      # Drop `:ro` if the log carries "laya: could not patch .../tokenizer_config.json": a
+      # locally trained checkpoint or a later revision does need the rewrite, and on a
+      # read-only mount the failure is only a warning -- AutoTokenizer then fails with
+      # "'list' object has no attribute 'keys'", which does not name the cause.
+      #
+      # Either way the directory must be readable by UID 10001, the user the image runs as.
+      - ${LAYA_WEIGHTS_PATH:?Set LAYA_WEIGHTS_PATH to the directory containing convaiinnovations}/convaiinnovations:/home/laya/convaiinnovations:ro
+
+  # The one-shot quickstart resolves checkpoints through the same Router, so the same mount
+  # serves it. Overriding `laya` here is safe in a way it would not be in compose.http.yaml:
+  # that file is an always-on override, while this one is opted into per command.
+  laya:
+    environment:
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - ${LAYA_WEIGHTS_PATH:?Set LAYA_WEIGHTS_PATH to the directory containing convaiinnovations}/convaiinnovations:/home/laya/convaiinnovations:ro
