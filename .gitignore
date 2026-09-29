@@ -42,6 +42,11 @@ model-*/
 *.onnx
 *.onnx.data
 
+# offline checkpoints (regenerate via scripts/fetch_offline_checkpoints.py --out ./weights)
+# multi-GB safetensors; compose.offline.yaml mounts the tree, git never carries it
+weights/
+*.safetensors
+
 # laya-ts: build output + deps
 laya-ts/dist/
 node_modules/
