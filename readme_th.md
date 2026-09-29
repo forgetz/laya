@@ -594,6 +594,49 @@ chmod -R a+rX weights/            # หรือ chown -R 10001:10001 weights/
 
 **rebuild image ยังต้องต่อเน็ต** — torch wheel + PyPI เก็บ `laya-serve.tar.gz` ไว้ หรือทำ local mirror
 
+### 11.6 รันโดยไม่ใช้ Docker
+
+ถ้าเครื่อง offline ไม่มี Docker ให้ลง laya ใส่ Python ตรง ๆ แทน ต้องเตรียม **wheelhouse** ไปด้วย
+เพราะ `pip install` ตอนนั้นจะไม่มี index ให้ยิงหา
+
+```bash
+# เครื่องที่มีเน็ต — torch ต้องแยกคำสั่งเพราะเลือก build จาก index ไม่ใช่จากเลข version
+pip download torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu -d wheelhouse/
+pip download -r requirements-offline-run.txt -d wheelhouse/
+tar czf laya-wheelhouse.tar.gz wheelhouse/
+```
+
+```bash
+# เครื่อง offline — จาก repo root
+tar xzf laya-wheelhouse.tar.gz
+pip install --no-index --find-links wheelhouse/ ".[serve]"
+```
+
+ที่ลง `".[serve]"` ไม่ใช่ `-r requirements-offline-run.txt` เพราะต้องได้ตัว package laya เองด้วย
+และ `torch>=2.0.0` ของมันจะไป resolve เอา wheel ที่โหลดไว้ใน wheelhouse — ได้ build ที่ต้องการ
+ส่วน `requirements-offline-run.txt` มีหน้าที่ทำให้ wheelhouse ครบ ไม่ได้เอาไว้ install ตรง ๆ
+
+CUDA เปลี่ยน `cpu` เป็น `cu128` (ตรงกับ `compose.cuda.yaml`) หรือ `cu130` (`compose.spark.yaml`)
+เลข `2.14.0` ให้ตรงกับ `TORCH_VERSION` ใน `compose.yaml` ไม่งั้น container กับ bare-metal
+ตอบไม่เหมือนกัน
+
+**รันจาก directory ไหนสำคัญ** — `Router` เรียก checkpoint ด้วยชื่อ `convaiinnovations/laya`
+แล้ว `Agent` เช็ค `os.path.isdir()` (`laya/agent.py:365`) ก่อนจะคิดเรื่องดาวน์โหลด แปลว่ามันเป็น
+**path relative กับ cwd** ต้องรันจากตัวที่ *มี* `convaiinnovations/` อยู่ข้างใน คือ `./weights`
+ไม่ใช่ repo root — ที่ container ทำได้เพราะ mount ไว้ที่ `/home/laya/convaiinnovations` และ cwd
+ของมันคือ `/home/laya` พอดี
+
+```bash
+cd weights
+HF_HUB_OFFLINE=1 LAYA_PRELOAD=1 LAYA_MODELS=english,multilingual laya-serve
+```
+
+env สามตัวทำหน้าที่เดียวกับที่ `compose.offline.yaml` ตั้งให้ (ดูตารางในข้อ 11.3) ต้องตั้งเองเพราะ
+ไม่มี compose มาตั้งให้แล้ว ตรวจผลด้วย `curl` เหมือน[ข้อ 11.4](#114-ตรวจสอบ)
+
+กับดักในข้อ 11.5 ที่ยังใช้ได้กับวิธีนี้: เรื่อง `LAYA_MODEL_PATH` ใช้กับ `laya-serve` ไม่ได้ และ
+`LAYA_REVISION` ไม่มีผล ส่วนเรื่อง `:ro` กับ permission UID 10001 เป็นของ bind mount ไม่เกี่ยว
+
 ---
 
 ## 12. ถ้ามี NVIDIA GPU

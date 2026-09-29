@@ -1,0 +1,53 @@
+# Runtime dependencies for serving laya on a host with no network and no Docker
+# (readme_th.md 11.6). The Docker path in 11.2 does not need this file at all: the image
+# carries its own virtualenv, so `docker load` is the whole install. Use this only when
+# installing into a plain interpreter.
+#
+# torch is deliberately absent. Its wheel variant is chosen by the index, not by the
+# version string: `torch==2.14.0` on PyPI is a different build from the same version on
+# download.pytorch.org/whl/cpu, and the mismatch is silent -- `docker/check_torch.py`
+# exists because of it. Download it under its own index, the way the Dockerfile does, then
+# everything here, then install the package against that directory:
+#
+#   # on a host with network
+#   pip download torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu -d wheelhouse/
+#   pip download -r requirements-offline-run.txt -d wheelhouse/
+#
+#   # on the offline host, from the repo root
+#   pip install --no-index --find-links wheelhouse/ ".[serve]"
+#
+# Installing `.[serve]` rather than this file is what pulls torch in: laya's own
+# `torch>=2.0.0` resolves against the wheelhouse, so the wheel downloaded above is the one
+# that lands. This file exists to make that wheelhouse complete.
+#
+# Swap cpu for cu128 / cu130 to match compose.cuda.yaml / compose.spark.yaml, and keep
+# TORCH_VERSION in step with compose.yaml (2.14.0) so a container and a bare-metal host
+# answer identically.
+#
+# No `==` pins here, because the wheelhouse is the lockfile: `--no-index --find-links` can
+# only install what `pip download` placed in it, so the offline host gets exactly the
+# resolution the networked host made, and re-resolving later cannot drift. The floors
+# instead mirror pyproject.toml, which is the file that would have to change first.
+
+# Wheels only. The offline host has neither a compiler nor an index to fetch build
+# requirements from, so an sdist in the wheelhouse would fail at install time, not now.
+--only-binary=:all:
+
+# laya core -- pyproject.toml [project.dependencies], minus torch as above.
+transformers>=4.48.0
+safetensors>=0.4.0
+numpy>=1.20.0
+# 0.23.0 rather than pyproject's 0.20.0, matching requirements-offline.txt, so one
+# wheelhouse covers both the fetch step (11.1) and the run step.
+huggingface_hub>=0.23.0
+
+# laya[serve] -- the laya-serve CLI, POST /v1/systemone and GET /health.
+fastapi>=0.110.0
+uvicorn>=0.27.0
+python-multipart>=0.0.9
+
+# `pip install .` builds a wheel from pyproject.toml first, and pip's build isolation would
+# fetch these from PyPI -- which the offline host cannot reach. The alternative is to leave
+# them out and pass --no-build-isolation to an interpreter that already has setuptools.
+setuptools>=61.0
+wheel
