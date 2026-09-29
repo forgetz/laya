@@ -479,8 +479,14 @@ docker compose -f compose.yaml -f compose.http.yaml logs --tail 50 laya-serve
 ### 11.1 เตรียมไฟล์ (เครื่องที่มีเน็ต)
 
 ```bash
+pip install -r requirements-offline.txt   # ข้ามได้ถ้าเครื่องนี้ติดตั้ง laya อยู่แล้ว
 python scripts/fetch_offline_checkpoints.py --out ./weights
 ```
+
+`requirements-offline.txt` มีแต่ `huggingface_hub` ตัวเดียว ไม่ลาก torch มา เครื่องที่ทำหน้าที่
+โหลดไฟล์เฉย ๆ จึงไม่ต้องลง laya ทั้งชุด — แลกกับที่สคริปต์จะข้ามขั้น pre-patch
+`tokenizer_config.json` (มัน import `laya.agent`) แล้วขึ้น `note:` บอกไว้ ซึ่งไม่เป็นไรกับ
+checkpoint ที่ publish อยู่ ดู [ข้อ 11.5](#115-กับดัก) ถ้าเจอ warning เรื่อง patch ตอนรัน
 
 โหลด `english` + `multilingual` เฉพาะ 4 อย่างที่ตัวโหลดเปิดอ่านจริง ไม่ดึง `typed-decisions` ติดมา
 ถ้าอยากได้ครบสามตัวใส่ `--models english,multilingual,typed-decisions`

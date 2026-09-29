@@ -1,0 +1,14 @@
+# scripts/fetch_offline_checkpoints.py only; not a runtime dependency of the laya package.
+# Lets the host that has network access fetch checkpoints without installing torch: the
+# script's tokenizer_config.json pre-patch imports laya.agent and degrades to a printed note
+# when that import fails, and --verify touches nothing but the standard library.
+#
+# 0.23.0 is a floor this script depends on, above the >=0.20.0 in pyproject.toml. Before it,
+# snapshot_download(local_dir=...) symlinked files over ~5MB into the shared blob cache, so
+# model.safetensors arrived as a dangling link once the tree was tar'd to another host. From
+# 0.23.0 the download writes real files and records progress in <local_dir>/.cache/huggingface,
+# which is what makes the tree survive tar, scp and a read-only bind mount.
+#
+# No upper bound: v1.0 dropped only `resume_download`, `force_filename` and
+# `local_dir_use_symlinks` from snapshot_download, none of which this script passes.
+huggingface_hub>=0.23.0
