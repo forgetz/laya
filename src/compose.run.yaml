@@ -1,0 +1,67 @@
+# Run the Laya gateway from an image that already carries everything, model included -- no build,
+# no source tree, no network. For the host that serves, after one of:
+#
+#   docker load < laya-gateway.tar.gz                 # image copied as a file
+#   docker pull registry.corp.local/laya-gateway:1.0  # image from an internal registry
+#
+# then, with only this file (and optionally a .env next to it):
+#
+#   docker compose -f compose.run.yaml up -d --wait
+#   curl -s localhost:8080/health
+#
+# Settings (environment or .env):
+#   LAYA_IMAGE           image to run (default laya-gateway:latest)
+#   LAYA_PULL_POLICY     never = only use a local image (air-gapped, the default);
+#                        missing = pull from the registry in LAYA_IMAGE when absent
+#   LAYA_API_KEY         bearer token for /predict (empty = no auth)
+#   LAYA_PORT            host port (default 8080)
+#   LAYA_CONTAINER_PORT  port inside the container (default 8080)
+#   LAYA_BIND_ADDRESS    127.0.0.1 = this machine only (default); 0.0.0.0 = the network
+#   LAYA_MODELS          subset of what the image was built with (default english,multilingual)
+#   OMP_NUM_THREADS      CPU threads for inference (default 4)
+#   LAYA_CPUS / LAYA_MEMORY  container limits (default 4 CPUs / 6g)
+name: laya-gateway
+
+services:
+  laya-gateway:
+    image: "${LAYA_IMAGE:-laya-gateway:latest}"
+    # `never` fails fast with "No such image" instead of trying a registry an air-gapped host
+    # cannot reach.
+    pull_policy: "${LAYA_PULL_POLICY:-never}"
+    ports:
+      - name: http
+        host_ip: "${LAYA_BIND_ADDRESS:-127.0.0.1}"
+        published: "${LAYA_PORT:-8080}"
+        target: ${LAYA_CONTAINER_PORT:-8080}
+        protocol: tcp
+    environment:
+      PORT: "${LAYA_CONTAINER_PORT:-8080}"
+      LAYA_API_KEY: "${LAYA_API_KEY:-}"
+      LAYA_MODELS: "${LAYA_MODELS:-english,multilingual}"
+      LAYA_DEVICE: "${LAYA_DEVICE:-cpu}"
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS:-4}"
+      # Already set in the image; repeated so this file states it: nothing reaches for the Hub.
+      HF_HUB_OFFLINE: "1"
+    # The model lives in the image, so nothing needs to be written at runtime. A read-only root
+    # filesystem keeps it that way; /tmp is the only scratch space Python and torch expect.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "${LAYA_CPUS:-4}"
+          memory: "${LAYA_MEMORY:-6g}"
+    init: true
+    restart: unless-stopped
+    # The image's HEALTHCHECK probes /health, which answers once both checkpoints are loaded,
+    # so `up --wait` returns when the API is usable.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

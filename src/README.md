@@ -11,6 +11,7 @@
 | `Dockerfile` | image ของ gateway ที่โหลด model มาตอน build |
 | `requirements.txt` | laya + fastapi + uvicorn สำหรับ gateway |
 | `compose.yaml` | Docker Compose สำหรับ build + รัน gateway |
+| `compose.run.yaml` | Docker Compose สำหรับรันจาก image ที่มีทุกอย่างแล้ว (ไม่ build ไม่ต่อเน็ต) |
 | `certs/` | วาง root CA ขององค์กร (`*.crt`) ถ้า proxy ถอด TLS — ดู[ข้อ 7](#7-ใช้หลัง-proxy-ขององค์กร) |
 
 คำสั่งด้านล่างเขียนสำหรับ Windows (PowerShell / Git Bash) และรันจากในโฟลเดอร์ `src/`
@@ -238,6 +239,28 @@ curl -s localhost:8080/predict \
 > ตัวอักษรอาจเพี้ยนก่อนถึง API (ลองจริง: ได้ `english` / `other` แทน `multilingual` / `billing`)
 > ให้เขียน body เป็นไฟล์ UTF-8 แล้วส่ง `curl --data-binary @request.json -H 'content-type: application/json'`
 > แทน — ปัญหาอยู่ที่ command line ไม่ใช่ที่ gateway
+
+### รันจาก image สำเร็จรูป (`compose.run.yaml`)
+
+เครื่องที่รันจริงไม่ต้องมี source code ไม่ต้อง build ไม่ต้องต่อเน็ต — มีแค่ image (ที่ฝัง model แล้ว)
+กับไฟล์ `compose.run.yaml` ไฟล์เดียว
+
+```bash
+docker load < laya-gateway.tar.gz        # หรือ docker pull จาก registry ขององค์กร
+docker compose -f compose.run.yaml up -d --wait
+```
+
+| ตัวแปร | default | ความหมาย |
+|---|---|---|
+| `LAYA_IMAGE` | `laya-gateway:latest` | image ที่จะรัน เช่น `registry.corp.local/laya-gateway:1.0` |
+| `LAYA_PULL_POLICY` | `never` | `never` = ใช้ image ในเครื่องเท่านั้น (ไม่มีจะ error ทันที) / `missing` = ดึงจาก registry ถ้าไม่มี |
+| `LAYA_CPUS` / `LAYA_MEMORY` | `4` / `6g` | จำกัด CPU / RAM ของ container (ลองจริงใช้ RAM ราว 3.6 GB) |
+
+ตัวแปรอื่น (`LAYA_API_KEY`, `LAYA_PORT`, `LAYA_BIND_ADDRESS`, ...) เหมือน `compose.yaml`
+
+ต่างจาก `compose.yaml` ตรงที่ไม่มี `build:` และเพิ่มการล็อกความปลอดภัย เพราะตอนรันไม่ต้องเขียนอะไรเลย:
+root filesystem เป็น read-only (มีแค่ `/tmp` เขียนได้), ตัด Linux capabilities ทั้งหมด,
+`no-new-privileges`, จำกัด CPU/RAM และจำกัดขนาด log — ลองจริงแล้ว healthy และ `/predict` ตอบปกติ
 
 ## 7. ใช้หลัง proxy ขององค์กร
 
