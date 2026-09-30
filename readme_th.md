@@ -483,6 +483,21 @@ pip install -r requirements-offline.txt   # ข้ามได้ถ้าเค
 python scripts/fetch_offline_checkpoints.py --out ./weights
 ```
 
+หรือถ้าเครื่องนี้มีแต่ Docker ไม่อยากลง Python ให้ Compose โหลดให้เลยด้วย service `laya-fetch`
+(รันสคริปต์ตัวเดียวกันใน image แล้วเขียนลง `./weights` บน host):
+
+```bash
+mkdir -p weights   # สร้างก่อน ไม่งั้นบน Linux Docker จะสร้างให้เป็นของ root
+LAYA_WEIGHTS_PATH=./weights docker compose \
+  -f compose.yaml -f compose.http.yaml -f compose.offline.yaml run --rm laya-fetch
+```
+
+argument ต่อท้ายส่งเข้าสคริปต์ตรง ๆ เช่น `... run --rm laya-fetch --revision <sha>` หรือ
+`--verify` ส่วน `--models` ตั้งจาก `LAYA_MODELS` ให้ตรงกับที่ `laya-serve` จะ preload
+service นี้อยู่ใน profile `fetch` จึงไม่ถูกสั่งขึ้นมาด้วย `up` เฉย ๆ บนเครื่อง offline
+build ใช้ layer เดียวกับ `laya-serve` ถ้า build ไว้แล้วก็แทบไม่เสียเวลา และ image ที่จะ
+`docker save` ในข้อ 11.2 ก็ build เสร็จพร้อมกันบนเครื่องนี้
+
 `requirements-offline.txt` มีแต่ `huggingface_hub` ตัวเดียว ไม่ลาก torch มา เครื่องที่ทำหน้าที่
 โหลดไฟล์เฉย ๆ จึงไม่ต้องลง laya ทั้งชุด — แลกกับที่สคริปต์จะข้ามขั้น pre-patch
 `tokenizer_config.json` (มัน import `laya.agent`) แล้วขึ้น `note:` บอกไว้ ซึ่งไม่เป็นไรกับ
@@ -723,6 +738,8 @@ docker compose -f compose.yaml -f compose.http.yaml down
 
 # offline (ดูข้อ 11)
 python scripts/fetch_offline_checkpoints.py --out ./weights          # เครื่องที่มีเน็ต
+LAYA_WEIGHTS_PATH=./weights docker compose \
+  -f compose.yaml -f compose.http.yaml -f compose.offline.yaml run --rm laya-fetch   # หรือให้ Docker โหลด
 python scripts/fetch_offline_checkpoints.py --out ./weights --verify # เครื่อง offline
 LAYA_WEIGHTS_PATH=./weights docker compose \
   -f compose.yaml -f compose.http.yaml -f compose.offline.yaml up -d --wait laya-serve

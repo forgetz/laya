@@ -179,9 +179,12 @@ def main() -> int:
         print("\nRe-run without --verify to fetch them.")
         return 1
 
-    print("\nOK: %s under %s (%s)" % (", ".join(models), out, human(tree_bytes(out))))
+    # Inside the `laya-fetch` Compose service `out` is the container's /weights; the host path
+    # the operator passed in is what the next command needs.
+    shown = os.environ.get("LAYA_WEIGHTS_PATH") or out
+    print("\nOK: %s under %s (%s)" % (", ".join(models), shown, human(tree_bytes(out))))
     print("\nNext, on the host that serves:")
-    print("  LAYA_WEIGHTS_PATH=%s \\" % out)
+    print("  LAYA_WEIGHTS_PATH=%s \\" % shown)
     print("    docker compose -f compose.yaml -f compose.http.yaml -f compose.offline.yaml \\")
     print("    up -d --wait laya-serve")
     print("\nLAYA_WEIGHTS_PATH names the directory containing convaiinnovations/, as above.")

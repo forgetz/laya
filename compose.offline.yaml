@@ -4,9 +4,15 @@
 #   LAYA_WEIGHTS_PATH=./weights docker compose \
 #     -f compose.yaml -f compose.http.yaml -f compose.offline.yaml up -d --wait laya-serve
 #
-# Populate that directory first, on a host that has network access:
+# Populate that directory first, on a host that has network access. Either with Python:
 #
 #   python scripts/fetch_offline_checkpoints.py --out ./weights
+#
+# or through Compose, with nothing on the host but Docker (see `laya-fetch` below):
+#
+#   mkdir -p weights
+#   LAYA_WEIGHTS_PATH=./weights docker compose \
+#     -f compose.yaml -f compose.http.yaml -f compose.offline.yaml run --rm laya-fetch
 #
 # LAYA_WEIGHTS_PATH names the directory that *contains* `convaiinnovations/`, which is what
 # the script writes and what the mount below appends.
@@ -64,3 +70,57 @@ services:
       HF_HUB_OFFLINE: "1"
     volumes:
       - ${LAYA_WEIGHTS_PATH:?Set LAYA_WEIGHTS_PATH to the directory containing convaiinnovations}/convaiinnovations:/home/laya/convaiinnovations:ro
+
+  # Runs scripts/fetch_offline_checkpoints.py inside the image, writing into LAYA_WEIGHTS_PATH on
+  # the host, so the fetch host needs Docker and nothing else. It is the one service here that
+  # talks to the Hub. Extra arguments reach the script:
+  #
+  #   ... run --rm laya-fetch --models english,multilingual,typed-decisions
+  #   ... run --rm laya-fetch --revision <sha>
+  #   ... run --rm laya-fetch --verify          # no network
+  #
+  # The `fetch` profile keeps it out of a bare `up`, which on the air-gapped host would otherwise
+  # start a download; `run` still selects it by name.
+  laya-fetch:
+    profiles: ["fetch"]
+    # Same build as laya-serve, so on a host that already built that image every layer is cached.
+    build:
+      context: .
+      args:
+        TORCH_INDEX: "${LAYA_TORCH_INDEX:-cpu}"
+        TORCH_VERSION: "${LAYA_TORCH_VERSION:-2.14.0}"
+    # Root, because a bind-mount directory Docker creates on a Linux host belongs to root and
+    # UID 10001 could not write into it. The tree is handed back to whoever owns the mount
+    # directory afterwards (`mkdir -p weights` first makes that you); files keep the default
+    # 0644/0755, so UID 10001 can read them from laya-serve either way.
+    user: "0:0"
+    # The image's entrypoint still runs first, so HF_TOKEN_FILE works here too. `$$` is a literal
+    # `$` for the shell; Compose would otherwise interpolate it.
+    entrypoint:
+      - python
+      - /opt/laya/entrypoint.py
+      - sh
+      - -c
+      - >-
+        python /opt/laya/fetch_offline_checkpoints.py --out /weights
+        --models "$${LAYA_MODELS:-english,multilingual}" "$$@";
+        rc=$$?;
+        chown -R "$$(stat -c %u:%g /weights)" /weights/convaiinnovations 2>/dev/null || true;
+        exit $$rc
+      - laya-fetch
+    command: []
+    environment:
+      HF_HUB_OFFLINE: "0"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      HF_TOKEN_FILE: "${HF_TOKEN_FILE:-}"
+      # Same default as laya-serve above, so what is fetched is what gets preloaded.
+      LAYA_MODELS: "${LAYA_MODELS:-english,multilingual}"
+      # Only for the "Next, on the host that serves" hint, which should print the host path
+      # rather than /weights.
+      LAYA_WEIGHTS_PATH: "${LAYA_WEIGHTS_PATH}"
+    volumes:
+      # scripts/ is not in the build context (.dockerignore), so the script is mounted rather
+      # than baked into an image the serving host also has to carry.
+      - ./scripts/fetch_offline_checkpoints.py:/opt/laya/fetch_offline_checkpoints.py:ro
+      - ${LAYA_WEIGHTS_PATH:?Set LAYA_WEIGHTS_PATH to the directory containing convaiinnovations}:/weights
+    init: true
