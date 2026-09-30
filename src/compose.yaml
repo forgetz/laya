@@ -1,0 +1,74 @@
+# Laya API gateway. The image downloads the checkpoints at build time and runs offline.
+#
+#   cd src
+#   docker compose up -d --build --wait
+#   curl -s localhost:8080/health
+#
+# Settings come from the environment or a `.env` file next to this one:
+#   LAYA_API_KEY       bearer token for /predict (empty = no auth; the port stays on loopback)
+#   LAYA_PORT            host port (default 8080)
+#   LAYA_CONTAINER_PORT  port uvicorn listens on inside the container (default 8080)
+#   LAYA_BIND_ADDRESS    host address (default 127.0.0.1; set 0.0.0.0 to expose on the network)
+#   LAYA_MODELS        checkpoints baked in and served (default english,multilingual)
+#   LAYA_REVISION      Hub commit to pin at build time
+#   OMP_NUM_THREADS    CPU threads for inference (default 4)
+#
+# HF token for the build download, without it ending up in the image:
+#   HF_TOKEN=hf_xxx docker compose build
+#
+# Behind a corporate proxy (build time only; the running container never goes online):
+#   HTTPS_PROXY=http://proxy.corp:8080 HTTP_PROXY=http://proxy.corp:8080 docker compose build
+# plus the proxy's root CA in certs/*.crt if it inspects TLS, and HF_HUB_DISABLE_XET=1 if the
+# model download still fails. Pulling the base image goes through the Docker daemon's own proxy
+# setting (Docker Desktop: Settings > Resources > Proxies), not these variables.
+name: laya-gateway
+
+services:
+  laya-gateway:
+    build:
+      context: .
+      args:
+        MODELS: "${LAYA_MODELS:-english,multilingual}"
+        REVISION: "${LAYA_REVISION:-}"
+        HF_HUB_DISABLE_XET: "${HF_HUB_DISABLE_XET:-}"
+        # Corporate proxy for pip and the model download, taken from the shell or .env. Listed
+        # without a value on purpose: an unset variable is then left out entirely, instead of
+        # being sent as "" and overriding a proxy Docker Desktop / ~/.docker/config.json already
+        # supplies. Docker keeps these out of `docker history`.
+        HTTP_PROXY:
+        HTTPS_PROXY:
+        NO_PROXY:
+        http_proxy:
+        https_proxy:
+        no_proxy:
+      secrets:
+        - hf_token
+    image: laya-gateway:latest
+    ports:
+      # <host address>:<host port> -> <container port>. The host side defaults to loopback, so
+      # only this machine can call the API; set LAYA_BIND_ADDRESS=0.0.0.0 (and LAYA_API_KEY) to
+      # accept other machines.
+      - name: http
+        host_ip: "${LAYA_BIND_ADDRESS:-127.0.0.1}"
+        published: "${LAYA_PORT:-8080}"
+        target: ${LAYA_CONTAINER_PORT:-8080}
+        protocol: tcp
+    expose:
+      - "${LAYA_CONTAINER_PORT:-8080}"
+    environment:
+      # uvicorn and the image's HEALTHCHECK both listen on / probe PORT, so it follows `target`.
+      PORT: "${LAYA_CONTAINER_PORT:-8080}"
+      LAYA_API_KEY: "${LAYA_API_KEY:-}"
+      # Must be a subset of what was baked in at build time (MODELS above).
+      LAYA_MODELS: "${LAYA_MODELS:-english,multilingual}"
+      LAYA_DEVICE: "${LAYA_DEVICE:-cpu}"
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS:-4}"
+    init: true
+    restart: unless-stopped
+    # The Dockerfile's HEALTHCHECK covers /health; `up --wait` waits for it, which is after both
+    # checkpoints are loaded.
+
+secrets:
+  hf_token:
+    # Empty when HF_TOKEN is unset; download_model.py then goes anonymous.
+    environment: HF_TOKEN

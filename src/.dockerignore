@@ -1,0 +1,7 @@
+# The image downloads its own weights at build time; never send the local copy or venv.
+**
+!requirements.txt
+!download_model.py
+!app.py
+!certs/
+!certs/**

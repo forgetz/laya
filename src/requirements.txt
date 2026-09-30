@@ -1,0 +1,4 @@
+# torch is installed separately (see Dockerfile / README.md) so the CPU wheel can be chosen.
+laya==0.3.22
+fastapi>=0.110
+uvicorn>=0.29
