@@ -8,6 +8,7 @@
 | `download_model.py` | โหลด checkpoint มาไว้ที่ `weights/` (ต้องต่อเน็ต ทำครั้งเดียว) |
 | `test_laya.py` | ทดสอบ laya — ใส่ `--weights weights` เพื่อรันแบบ offline |
 | `app.py` | API gateway (FastAPI) ส่งค่าเข้า laya — ดู[ข้อ 6](#6-api-gateway-apppy) |
+| `API.md`, `openapi.yaml` | API spec ของ gateway — request / response / error ของแต่ละ endpoint |
 | `Dockerfile` | image ของ gateway ที่โหลด model มาตอน build |
 | `requirements.txt` | laya + fastapi + uvicorn สำหรับ gateway |
 | `compose.yaml` | Docker Compose สำหรับ build + รัน gateway |

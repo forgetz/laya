@@ -1,0 +1,573 @@
+# OpenAPI spec for the Laya gateway (app.py). Human-readable version (Thai): API.md
+#
+# Hand-written, because app.py returns Router.predict()'s dict as-is and so FastAPI's generated
+# /openapi.json has no response schemas. The response shapes and examples here were recorded from
+# the gateway running laya 0.3.22 on CPU with the english + multilingual checkpoints.
+openapi: 3.1.0
+info:
+  title: Laya gateway
+  version: "1.0.0"
+  description: |
+    HTTP gateway in front of laya's `Router`. One request carries a `state` (the text or document
+    to decide on) and any number of `questions` over it; each question is answered as a
+    `choice`, a `score` or a `noul` (yes/no probability).
+
+    Inference runs one request at a time (a process-wide lock); concurrent requests queue.
+    The first request after startup is not slower than later ones: checkpoints are loaded before
+    the server starts accepting requests.
+servers:
+  - url: http://localhost:8080
+    description: Default (`LAYA_BIND_ADDRESS`:`LAYA_PORT` in compose.yaml)
+tags:
+  - name: health
+  - name: predict
+paths:
+  /health:
+    get:
+      tags: [health]
+      operationId: health
+      summary: Liveness and which checkpoints are loaded
+      description: Never requires a token, even when `LAYA_API_KEY` is set.
+      responses:
+        "200":
+          description: The router is built and the checkpoints are loaded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              example:
+                status: ok
+                loaded: [english, multilingual]
+                models: [english, multilingual]
+                offline: true
+        "503":
+          description: The server is still starting (or shutting down).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: starting
+  /predict:
+    post:
+      tags: [predict]
+      operationId: predict
+      summary: Answer questions about one state
+      security:
+        - bearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PredictRequest"
+            examples:
+              english:
+                summary: Three question types over an English message
+                value:
+                  state: Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan.
+                  questions:
+                    department:
+                      type: choice
+                      instructions: Which department should handle this?
+                      criteria:
+                        billing: invoices, payments, refunds
+                        technical: bugs, outages, system errors
+                        other: everything else
+                    urgency:
+                      type: score
+                      instructions: How urgent is this?
+                      criteria: [not urgent, soon, blocking]
+                    churn_risk:
+                      type: noul
+                      instructions: Does the user threaten to cancel or leave?
+              thai:
+                summary: Thai text, routed to the multilingual checkpoint
+                value:
+                  state: โดนเก็บเงินซ้ำสองครั้งเดือนมีนาคม ขอคืนเงินวันนี้ ไม่งั้นจะยกเลิกแพ็กเกจ
+                  questions:
+                    churn_risk:
+                      type: noul
+                      instructions: Does the user threaten to cancel or leave?
+              forced:
+                summary: Force a checkpoint and flag low-confidence answers
+                value:
+                  state: We were billed twice. Refund it or we cancel.
+                  model: multilingual
+                  min_confidence: 0.9
+                  questions:
+                    churn_risk:
+                      type: noul
+                      instructions: Does the user threaten to cancel or leave?
+      responses:
+        "200":
+          description: One answer per question id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PredictResponse"
+              examples:
+                english:
+                  summary: Response to the `english` request example
+                  value:
+                    model: laya-rl-agent
+                    answers:
+                      department:
+                        type: choice
+                        choice: billing
+                        probabilities: {billing: 0.9865, technical: 0.008, other: 0.0055}
+                        confidence: 0.9267
+                        answer_confidence: 0.9865
+                        action: {act_probability: 1.0}
+                      urgency:
+                        type: score
+                        score: 1.7722
+                        legend: {"0": not urgent, "1": soon, "2": blocking}
+                        probabilities: {"0": 0.0389, "1": 0.15, "2": 0.8111}
+                        confidence: 0.4714
+                        answer_confidence: 0.8111
+                        action: {act_probability: 1.0}
+                      churn_risk:
+                        type: noul
+                        noul: 0.879
+                        confidence: 0.879
+                        answer_confidence: 0.879
+                        action: {act_probability: 1.0}
+                    usage:
+                      input_tokens: 164
+                      output_tokens: 0
+                      state_tokens: 21
+                      state_tokens_dropped: 0
+                      truncated: false
+                      truncated_questions: []
+                    routing:
+                      model: english
+                      repo: convaiinnovations/laya
+                      reason: English Latin text
+                      detection:
+                        script: latin
+                        script_profile: {latin: 1.0}
+                        language: en
+                        is_english: true
+                        language_undecided: false
+                        diacritic_rate: 0.0
+                        non_latin_fraction: 0.0
+                        mixed_segment: null
+                      workflow: null
+                thai:
+                  summary: Response to the `thai` request example
+                  value:
+                    model: laya-rl-agent
+                    answers:
+                      churn_risk:
+                        type: noul
+                        noul: 0.0346
+                        confidence: 0.9654
+                        answer_confidence: 0.9654
+                        action: {act_probability: 1.0}
+                    usage:
+                      input_tokens: 64
+                      output_tokens: 0
+                      state_tokens: 29
+                      state_tokens_dropped: 0
+                      truncated: false
+                      truncated_questions: []
+                    routing:
+                      model: multilingual
+                      repo: convaiinnovations/laya/multilingual
+                      reason: non-Latin script (thai, 100% of letters); the English checkpoint cannot read it
+                      detection:
+                        script: thai
+                        script_profile: {thai: 1.0}
+                        language: null
+                        is_english: false
+                        language_undecided: true
+                        diacritic_rate: 0.0
+                        non_latin_fraction: 1.0
+                        mixed_segment: null
+                      workflow: null
+        "400":
+          $ref: "#/components/responses/ModelNotServed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /predict/batch:
+    post:
+      tags: [predict]
+      operationId: predictBatch
+      summary: Answer questions about several states in one call
+      description: |
+        Each item is a `/predict` body and may use its own questions, `model` and `lang`. Items
+        are grouped by checkpoint and question set so they can share forward passes; `results`
+        comes back in the order of `requests`.
+
+        The batch is all-or-nothing: one invalid item fails the whole call with the status that
+        item would have got from `/predict`, and no partial results are returned.
+
+        `min_confidence` inside a batch item is accepted but has no effect (verified: an answer
+        with `answer_confidence` 0.9654 and `min_confidence` 0.99 comes back without
+        `low_confidence`). Apply the threshold on the client for batch results, or use `/predict`.
+      security:
+        - bearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchRequest"
+            example:
+              requests:
+                - state: We were billed twice. Refund it or we cancel.
+                  questions:
+                    churn_risk:
+                      type: noul
+                      instructions: Does the user threaten to cancel or leave?
+                - state: โดนเก็บเงินซ้ำสองครั้งเดือนมีนาคม ขอคืนเงินวันนี้ ไม่งั้นจะยกเลิกแพ็กเกจ
+                  questions:
+                    churn_risk:
+                      type: noul
+                      instructions: Does the user threaten to cancel or leave?
+      responses:
+        "200":
+          description: One result per request, in request order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/ModelNotServed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "500":
+          $ref: "#/components/responses/InternalError"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Required on `/predict` and `/predict/batch` only when the server was started with
+        `LAYA_API_KEY`; the token is that key. Without `LAYA_API_KEY` the header is ignored.
+  responses:
+    ModelNotServed:
+      description: "`model` names a checkpoint that is not in the server's `LAYA_MODELS`."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            detail: "model 'typed-decisions' is not served here; choose from ['english', 'multilingual']"
+    Unauthorized:
+      description: "`LAYA_API_KEY` is set and the bearer token is missing or wrong."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            detail: missing or invalid bearer token
+    Unprocessable:
+      description: |
+        The body was rejected. `detail` has two shapes, so check its type:
+
+        - an **array** when the body does not match the request schema (invalid JSON, a missing
+          or mistyped field, `requests` empty or over 256 items);
+        - a **string** `"<ExceptionName>: <message>"` when the body is well-formed but laya
+          rejects it (unknown question type, bad `criteria`, `min_confidence` outside 0..1).
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ValidationError"
+              - $ref: "#/components/schemas/Error"
+          examples:
+            schema:
+              summary: Body does not match the schema (detail is an array)
+              value:
+                detail:
+                  - type: missing
+                    loc: [body, questions]
+                    msg: Field required
+                    input: {state: "..."}
+            laya:
+              summary: laya rejects the question (detail is a string)
+              value:
+                detail: "ValueError: question 'x': unknown type 'nope'; use one of ['choice', 'noul', 'score']"
+    InternalError:
+      description: Inference failed for a reason other than bad input. The body is plain text, not JSON.
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: Internal Server Error
+  schemas:
+    Health:
+      type: object
+      required: [status, loaded, models, offline]
+      properties:
+        status:
+          type: string
+          const: ok
+        loaded:
+          type: array
+          items: {type: string}
+          description: Checkpoints currently in memory.
+        models:
+          type: array
+          items: {type: string}
+          description: The server's `LAYA_MODELS` - the values `model` accepts.
+        offline:
+          type: boolean
+          description: True when the server runs with `HF_HUB_OFFLINE=1`.
+    PredictRequest:
+      type: object
+      required: [state, questions]
+      properties:
+        state:
+          description: |
+            What to decide on. A string is used as-is; an object or array (a ticket, an email,
+            a list of chat messages) is serialized by laya before it is read. An empty string
+            is accepted and answered.
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties: true
+            - type: array
+              items: {}
+        questions:
+          type: object
+          description: |
+            Question id -> definition. The ids are yours and come back as the keys of
+            `answers`. An empty object is accepted and returns `answers: {}`.
+          additionalProperties:
+            $ref: "#/components/schemas/Question"
+        model:
+          type: [string, "null"]
+          description: |
+            Force a checkpoint. Must be one of `models` from `/health`, spelled exactly that
+            way (aliases and Hugging Face ids are a 400). Omit to route by language.
+          examples: [english, multilingual]
+        lang:
+          type: [string, "null"]
+          description: |
+            Language hint that replaces detection: an English code (`en`, `en-US`, `en_US`)
+            routes to `english`, any other value routes to `multilingual`. The value is not
+            validated - an unknown code counts as non-English. Ignored when `model` is set.
+          examples: [th, en]
+        min_confidence:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 1
+          description: |
+            Answers whose `answer_confidence` is below this get `low_confidence: true`; the
+            answer itself is unchanged. `/predict` only - see `/predict/batch`.
+    Question:
+      type: object
+      required: [type, instructions]
+      properties:
+        type:
+          type: string
+          enum: [choice, score, noul]
+        instructions:
+          type: string
+          description: The question, in plain language.
+        criteria:
+          description: |
+            - `choice` (required): object of option label -> description, or an array of labels.
+            - `score` (required): array of level texts, lowest first.
+            - `noul`: not needed.
+          oneOf:
+            - type: object
+              additionalProperties: {type: string}
+            - type: array
+              items: {type: string}
+      additionalProperties: true
+    BatchRequest:
+      type: object
+      required: [requests]
+      properties:
+        requests:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/PredictRequest"
+    BatchResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/PredictResponse"
+    PredictResponse:
+      type: object
+      required: [model, answers, usage, routing]
+      properties:
+        model:
+          type: string
+          description: Constant name of the decision head. The checkpoint that answered is `routing.model`.
+          examples: [laya-rl-agent]
+        answers:
+          type: object
+          description: Keyed by the question ids of the request.
+          additionalProperties:
+            oneOf:
+              - $ref: "#/components/schemas/ChoiceAnswer"
+              - $ref: "#/components/schemas/ScoreAnswer"
+              - $ref: "#/components/schemas/NoulAnswer"
+            discriminator:
+              propertyName: type
+              mapping:
+                choice: "#/components/schemas/ChoiceAnswer"
+                score: "#/components/schemas/ScoreAnswer"
+                noul: "#/components/schemas/NoulAnswer"
+        usage:
+          $ref: "#/components/schemas/Usage"
+        routing:
+          $ref: "#/components/schemas/Routing"
+    AnswerCommon:
+      type: object
+      required: [type, confidence, answer_confidence, action]
+      properties:
+        confidence:
+          type: number
+          description: |
+            `choice` / `score`: `1 - H(p)/log(k)` (normalized entropy). `noul`: `max(p_yes, p_no)`.
+            Not comparable with `answer_confidence` against one threshold.
+        answer_confidence:
+          type: number
+          description: Probability of the reported answer (`max(p)`). `min_confidence` compares against this.
+        action:
+          type: object
+          properties:
+            act_probability: {type: number}
+        low_confidence:
+          type: boolean
+          description: Present (and true) only when `min_confidence` was sent and `answer_confidence` is below it.
+    ChoiceAnswer:
+      allOf:
+        - $ref: "#/components/schemas/AnswerCommon"
+        - type: object
+          required: [choice, probabilities]
+          properties:
+            type: {const: choice}
+            choice:
+              type: string
+              description: The most probable option label.
+            probabilities:
+              type: object
+              description: Option label -> probability.
+              additionalProperties: {type: number}
+    ScoreAnswer:
+      allOf:
+        - $ref: "#/components/schemas/AnswerCommon"
+        - type: object
+          required: [score, legend, probabilities]
+          properties:
+            type: {const: score}
+            score:
+              type: number
+              description: Expected level index, 0 .. k-1; usually falls between two levels.
+            legend:
+              type: object
+              description: Level index (as a string) -> the level text from `criteria`.
+              additionalProperties: {type: string}
+            probabilities:
+              type: object
+              description: Level index (as a string) -> probability.
+              additionalProperties: {type: number}
+    NoulAnswer:
+      allOf:
+        - $ref: "#/components/schemas/AnswerCommon"
+        - type: object
+          required: [noul]
+          properties:
+            type: {const: noul}
+            noul:
+              type: number
+              description: Probability that the answer is yes, 0 .. 1.
+    Usage:
+      type: object
+      required: [input_tokens, output_tokens]
+      properties:
+        input_tokens: {type: integer}
+        output_tokens:
+          type: integer
+          description: Always 0; laya generates no text.
+        state_tokens:
+          type: integer
+          description: Tokens of `state` that were read. Absent when `questions` is empty.
+        state_tokens_dropped:
+          type: integer
+          description: Tokens of `state` cut off because it exceeded the model's window.
+        truncated:
+          type: boolean
+          description: True when part of `state` was dropped - the answers saw only part of the input.
+        truncated_questions:
+          type: array
+          items: {type: string}
+          description: Ids of the questions whose text was cut.
+    Routing:
+      type: object
+      required: [model, repo, reason]
+      properties:
+        model:
+          type: string
+          description: The checkpoint that answered.
+          examples: [english, multilingual]
+        repo:
+          type: string
+          examples: [convaiinnovations/laya, convaiinnovations/laya/multilingual]
+        reason:
+          type: string
+          description: Why this checkpoint, for people to read. Do not parse it.
+        detection:
+          description: Language-detection evidence; null when `model` or `lang` decided the route.
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                script: {type: string, examples: [latin, thai, unknown]}
+                script_profile:
+                  type: object
+                  additionalProperties: {type: number}
+                language: {type: [string, "null"]}
+                is_english: {type: boolean}
+                language_undecided: {type: boolean}
+                diacritic_rate: {type: number}
+                non_latin_fraction: {type: number}
+                mixed_segment: {}
+        workflow:
+          type: [string, "null"]
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail: {type: string}
+    ValidationError:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            required: [type, loc, msg]
+            properties:
+              type: {type: string}
+              loc:
+                type: array
+                items:
+                  oneOf:
+                    - {type: string}
+                    - {type: integer}
+              msg: {type: string}
+              input: {}
+              ctx: {type: object}
