@@ -85,13 +85,47 @@ class QuestionTokenReuse(unittest.TestCase):
                         for key in left:
                             self.assertTrue(left[key].equal(right[key]), key)
 
+    def test_onnx_agent_reuses_question_tokens_across_states(self):
+        from laya.onnx_agent import ONNXAgent
+        states = ["state %d" % i for i in range(10)]
+        tok = Tokenizer()
+        agent = ONNXAgent.__new__(ONNXAgent)
+        agent.tok = tok
+        agent.cfg = {"max_len": 512, "head_max_len": 192}
+        agent.temperature = [1.0, 1.0, 1.0]
+        agent.temperature_by_options = {}
+        agent.lang_temperatures = {}
+        agent.hooks = ()
+        agent.hooks_raise = True
+        agent.hooks_concurrent = True
+        agent.hooks_timeout = None
+        agent._hooks_lock = None
+        agent._hooks_mutex = threading.Lock()
+
+        class StubSession:
+            def run(self, names, inputs):
+                n = len(inputs["input_ids"])
+                return [np.zeros((n, 2), dtype=np.float32), np.zeros((n, 2), dtype=np.float32)]
+
+        agent.session = StubSession()
+        tok.calls.clear()
+        agent.predict_batch(states, QUESTIONS)
+        # 10 states + 3 question encodes (1 instruction + 2 options)
+        self.assertEqual(len(tok.calls), len(states) + 3)
+
     def test_predict_long_uses_the_same_cache_for_all_windows(self):
         tok = Tokenizer()
         agent = agent_with(tok)
-        agent.predict_long("x" * 1000, QUESTIONS, window=80, stride=50, batch_size=3)
+        scanned = agent.predict_long("x" * 1000, QUESTIONS, window=80, stride=50, batch_size=3)
         head = "choice question: " + QUESTION["ins"]
-        self.assertEqual(sum(text == head for _, text, _ in tok.calls), 1)
-        self.assertEqual(sum(text == " billing: charges" for _, text, _ in tok.calls), 1)
+        # Twice, not once per window: predict_long assembles each question's head once on its own
+        # to measure the room the question leaves for the state -- the cap on the window -- and the
+        # scan that follows then shares one cache across every window it scores. The point of this
+        # test is the second number: the head is encoded a fixed number of times, not once per
+        # window, which the assertion below states as such.
+        self.assertEqual(sum(text == head for _, text, _ in tok.calls), 2)
+        self.assertEqual(sum(text == " billing: charges" for _, text, _ in tok.calls), 2)
+        self.assertGreater(scanned["usage"]["windows"], 2)
         self.assertGreater(len(agent.batches), 1)
 
     def test_sequence_parity_for_rendering_order_and_budgets(self):

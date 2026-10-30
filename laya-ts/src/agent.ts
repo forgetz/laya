@@ -1,9 +1,12 @@
 import {
   TEMP_MAX,
   TEMP_MIN,
+  applyBinningMap,
   buildQuestionPrefix,
+  checkBinningMap,
   clampTemperature,
   collateItems,
+  collapsedOptions,
   confidenceFromProbs,
   answerConfidence,
   checkMinConfidence,
@@ -14,11 +17,13 @@ import {
   serializeState,
   softmax,
   tempBucket,
+  unpermuteProbs,
 } from "./common.js";
-import type { SequenceStats } from "./common.js";
+import type { BinningMap, InternalQ, MinConfidence, OptionStats, SequenceStats } from "./common.js";
 import type { Batch, SessionProvider } from "./providers.js";
+import type { OptionStabilityReport } from "./option-stability.js";
 import { encodeWithData, parseTokenizerJson, type TokenizerLike } from "./tokenizer.js";
-import { decide, type DecideOptions, type DecisionResult } from "./structured.js";
+import { decide, decideBatch, type DecideOptions, type DecideBatchOptions, type DecisionResult } from "./structured.js";
 import {
   HookRegistry,
   PredictContext,
@@ -52,6 +57,7 @@ export interface ChoiceAnswer {
   answer_confidence: number;
   action: ActionInfo;
   low_confidence?: boolean;
+  reliability?: OptionStabilityReport;
 }
 
 export interface ScoreAnswer {
@@ -86,6 +92,9 @@ export interface SystemUsage {
   state_tokens_dropped?: number;
   truncated?: boolean;
   truncated_questions?: string[];
+  /** Present only when some question's options no longer have a token span each (issue #538,
+   * Python `collapsed_options`), keyed by question id. Absent when every option kept its own. */
+  options?: Record<string, OptionStats>;
 }
 
 export interface SystemOneResult {
@@ -99,6 +108,7 @@ export interface AgentCfg {
   head_max_len?: number;
   temperature?: unknown;
   temperature_by_options?: Record<string, unknown>;
+  binning_map?: BinningMap | null;
   [k: string]: unknown;
 }
 
@@ -112,6 +122,9 @@ export interface AgentOptions {
   head_max_len?: number;
   temperature?: unknown;
   temperature_by_options?: Record<string, unknown>;
+  /** Optional histogram-binning map applied to answer_confidence. */
+  binning_map?: BinningMap | null;
+  binningMap?: BinningMap | null;
   /**
    * Per-language temperature overrides, keyed by language code; keys are normalised to
    * their base subtag (`de-AT` -> `de`), matching Python `Agent(lang_temperatures=...)`.
@@ -127,6 +140,8 @@ export interface AgentOptions {
   onPredictStart?: PredictHook;
   onPredictEnd?: PredictHook;
   hooksRaise?: boolean;
+  /** Timeout for each hook call in seconds (null = no limit). */
+  hooksTimeout?: number | null;
 }
 
 /** Per-call options shared by Agent.systemOne/predict and Router.predict. */
@@ -141,22 +156,36 @@ export interface PredictOptions {
   onPredictStart?: PredictHook;
   onPredictEnd?: PredictHook;
   hooksRaise?: boolean;
+  /** Timeout for each hook call in seconds (null = no limit). */
+  hooksTimeout?: number | null;
   /** Per-call token-budget overrides; null = agent config. A start hook may also set them. */
   maxLen?: number | null;
   headMaxLen?: number | null;
   /** predictBatch: cap on states per shared forward pass; null sends them all in one pass. */
   batchSize?: number | null;
-  /** Minimum confidence threshold in [0.0, 1.0]. Low confidence answers get `low_confidence: true`. */
-  minConfidence?: number | null;
+  /** Minimum confidence threshold in [0.0, 1.0] or per-bucket map. Low confidence answers get `low_confidence: true`. */
+  minConfidence?: MinConfidence | null;
   /** Python parity alias for minConfidence. */
-  min_confidence?: number | null;
+  min_confidence?: MinConfidence | null;
 }
 
 function qidStr(qid: string): string {
   return JSON.stringify(qid);
 }
 
+/** How many options a validated question definition renders to -- `laya.agent._option_count`
+ * (`laya/agent.py:321-330`): a choice has one per criterion, a score one per level, a noul is always
+ * the pair [false, true]. */
+function optionCount(qdef: Record<string, unknown>): number {
+  if (qdef["type"] === "noul") return 2;
+  const crit = qdef["criteria"];
+  return Array.isArray(crit) || (typeof crit === "object" && crit !== null) ? Object.keys(crit).length : 0;
+}
+
 export function checkQuestion(qid: string, qdef: unknown): void {
+  if (typeof qid !== "string" || !qid.trim()) {
+    throw new Error(`question id must be a non-empty string, got ${qidStr(qid)}`);
+  }
   if (typeof qdef !== "object" || qdef === null || Array.isArray(qdef)) {
     const got = Array.isArray(qdef) ? "list" : qdef === null ? "NoneType" : typeof qdef;
     throw new Error(`question ${qidStr(qid)}: definition must be a dict, got ${got}`);
@@ -170,6 +199,36 @@ export function checkQuestion(qid: string, qdef: unknown): void {
   }
   if (!("instructions" in q)) {
     throw new Error(`question ${qidStr(qid)}: no 'instructions'; add the text the model should answer`);
+  }
+  // `instructions` is the text the model is asked, so a null or empty one is not a weak question
+  // but a question with nothing to answer. Only the key's presence was checked, and `toInternal`
+  // then serialised whatever it found, so a null reached the model as the literal prompt "null",
+  // an empty dict as "{}", and a blank string stayed blank -- the caller's error answered
+  // silently. Python's `Agent._check_question` rejects all of these; these are the same three
+  // rejections in the same order.
+  const ins = q["instructions"];
+  if (ins === null || ins === undefined) {
+    throw new Error(
+      `question ${qidStr(qid)}: 'instructions' must not be None; add the text the model should answer`,
+    );
+  }
+  if (typeof ins === "string" && !ins.trim()) {
+    throw new Error(
+      `question ${qidStr(qid)}: 'instructions' must not be empty; add the text the model should answer`,
+    );
+  }
+  // An object here is a list or a dict, and both are empty exactly when they own no keys.
+  if (typeof ins === "object" && Object.keys(ins as object).length === 0) {
+    throw new Error(
+      `question ${qidStr(qid)}: 'instructions' must not be empty; add the text the model should answer`,
+    );
+  }
+  // Python allows str, dict, list, int and float. A bool is an int there, so it passes as well;
+  // a function or a symbol is nothing either side can turn into a question.
+  if (!["string", "object", "number", "bigint", "boolean"].includes(typeof ins)) {
+    throw new Error(
+      `question ${qidStr(qid)}: 'instructions' must be a string, dict, or list, got ${typeof ins}`,
+    );
   }
   const crit = q["criteria"];
   if (t === "choice") {
@@ -243,6 +302,29 @@ export function checkQuestion(qid: string, qdef: unknown): void {
       );
     }
   }
+  // Slot `s` of the head's row shows option `order[s]`, so an order that is not a permutation of the
+  // option indices would either drop an option or show one twice. Python refuses it here
+  // (`laya/agent.py:1088-1099`) rather than let it reach the encoder, and the same numbers say why:
+  // the decoder un-permutes by the same list, so a short order leaves slots unmapped.
+  if (Object.hasOwn(q, "option_order")) {
+    const order = q["option_order"];
+    const n = optionCount(q);
+    const ints = Array.isArray(order)
+      // Python keeps `isinstance(i, int) and not isinstance(i, bool)`, which rejects a float option
+      // index; JavaScript has one number type, so an integral value is the closest match, and
+      // `[1.0, 0.0]` is not a value a caller can even write here.
+      ? order.filter((i) => typeof i === "number" && Number.isInteger(i))
+      : null;
+    const isPermutation =
+      ints !== null && ints.length === n &&
+      [...ints].sort((a, b) => a - b).join(",") === Array.from({ length: n }, (_, i) => i).join(",");
+    if (!isPermutation) {
+      throw new Error(
+        `question ${qidStr(qid)}: 'option_order' must be a permutation of range(${n}) -- one slot per ` +
+          `option, each option once -- got ${JSON.stringify(order)}`,
+      );
+    }
+  }
   if ("labels" in q && t !== "noul") {
     throw new Error(`question ${qidStr(qid)}: 'labels' is only supported for noul questions`);
   }
@@ -271,7 +353,21 @@ function isPlainDict(o: unknown): o is Record<string, unknown> {
   return proto === null || proto === Object.prototype;
 }
 
-export function toInternal(qdef: QuestionDef): { t: "choice" | "score" | "noul"; ins: string; crit: unknown; labels?: { false: string; true: string } } {
+/** Whether a `temperature_by_options` value means "no override" in Python.
+ *
+ * `cfg.get("temperature_by_options") or {}` turns every Python-falsy value into `{}`, and the
+ * two languages disagree about which values those are: an empty array is truthy in JavaScript,
+ * and NaN is falsy here while truthy in Python. So the set is named rather than inferred from
+ * JavaScript truthiness. Python's own falsy values are `[]`, `{}`, `0`, `0.0`, `False`, `None`
+ * and `""`; `{}` needs no case here because a dict is accepted either way.
+ */
+function isEmptyOverride(v: unknown): boolean {
+  if (v === null || v === undefined || v === false || v === "") return true;
+  if (v === 0) return true; // `===`, not Object.is: that distinguishes -0 from 0
+  return Array.isArray(v) && v.length === 0; // [] -- truthy in JavaScript
+}
+
+export function toInternal(qdef: QuestionDef): InternalQ {
   const t = qdef["type"] as "choice" | "score" | "noul";
   let crit: unknown = qdef["criteria"];
   if (t === "choice" && Array.isArray(crit)) {
@@ -281,12 +377,18 @@ export function toInternal(qdef: QuestionDef): { t: "choice" | "score" | "noul";
   }
   let ins: unknown = qdef["instructions"];
   if (typeof ins !== "string") ins = serializeState(ins);
-  const out: { t: "choice" | "score" | "noul"; ins: string; crit: unknown; labels?: { false: string; true: string } } = {
+  const out: InternalQ = {
     t, ins: ins as string, crit,
   };
   if (t === "noul" && qdef["labels"] && typeof qdef["labels"] === "object" && !Array.isArray(qdef["labels"])) {
     const labels = qdef["labels"] as Record<string, unknown>;
     out.labels = { false: String(labels["false"]).trim(), true: String(labels["true"]).trim() };
+  }
+  // `Agent._to_internal` carries the validated order onto the internal question (`laya/agent.py:1128-1129`),
+  // which is what lets one object drive both halves: `_encodeItems` presents options in it and
+  // `_decodeRow` inverts the row back out of it.
+  if (Object.hasOwn(qdef, "option_order")) {
+    out.optionOrder = (qdef["option_order"] as number[]).map((i) => Math.trunc(Number(i)));
   }
   return out;
 }
@@ -324,6 +426,7 @@ const r4 = (v: number): number => Math.round(v * 1e4) / 1e4;
 
 export class Agent extends HookRegistry {
   hooksRaise: boolean;
+  hooksTimeout?: number | null;
   cfg: AgentCfg;
   provider: SessionProvider;
   revision: string | null;
@@ -334,6 +437,7 @@ export class Agent extends HookRegistry {
   temperatureByOptionsRaw: Record<string, unknown>;
   temperature: number[];
   temperatureByOptions: Record<string, number>;
+  readonly binningMap: BinningMap | null;
   langTemperatures: Record<
     string,
     { temperature: number[]; temperatureByOptions: Record<string, number> }
@@ -347,15 +451,20 @@ export class Agent extends HookRegistry {
     // Hooks are opt-in; an unset hook list is a no-op. See hooks.ts.
     this.hooks = normaliseHooks(opts.hooks, opts.onPredictStart, opts.onPredictEnd);
     this.hooksRaise = opts.hooksRaise ?? true;
+    this.hooksTimeout = opts.hooksTimeout ?? null;
     const cfg = { ...(opts.cfg ?? {}) } as AgentCfg;
     if (opts.max_len !== undefined) cfg.max_len = opts.max_len;
     if (opts.head_max_len !== undefined) cfg.head_max_len = opts.head_max_len;
     if (opts.temperature !== undefined) cfg.temperature = opts.temperature;
     if (opts.temperature_by_options !== undefined) cfg.temperature_by_options = opts.temperature_by_options;
+    if (opts.binning_map !== undefined) cfg.binning_map = opts.binning_map;
+    if (opts.binningMap !== undefined) cfg.binning_map = opts.binningMap;
     this.cfg = cfg;
     this.maxLen = Number(cfg.max_len ?? 512);
     this.headMaxLen = Number(cfg.head_max_len ?? 192);
     this.tok = opts.tok ?? defaultTokenizer();
+    const bmapRaw = cfg.binning_map;
+    this.binningMap = bmapRaw !== undefined && bmapRaw !== null ? checkBinningMap(bmapRaw) : null;
     const raw = (cfg.temperature ?? [1.0, 1.0, 1.0]) as unknown;
     this.temperatureRaw = raw;
     // The decode indexes this by question type, so refuse any other shape here, as Python's
@@ -379,7 +488,10 @@ export class Agent extends HookRegistry {
     ];
     const rejected: string[] = [];
     for (const [name, rawV, applied] of entries) {
-      if (Number(rawV) === applied) continue;
+      // `clampTemperature` refuses a bool and installs the neutral 1.0, and `Number(true)` is
+      // exactly that 1.0, so comparing the two numbers alone read a JSON `true` as an accepted
+      // temperature and loaded it in silence. `false` was reported only because it floats to 0.0.
+      if (typeof rawV !== "boolean" && Number(rawV) === applied) continue;
       rejected.push(`${name}=${JSON.stringify(rawV) ?? String(rawV)} -> ${applied}`);
     }
     if (rejected.length > 0) {
@@ -399,11 +511,23 @@ export class Agent extends HookRegistry {
           `Language override ${JSON.stringify(l)} temperature must be a list of 3 floats`,
         );
       }
-      const tboRaw = (lc?.temperature_by_options ?? {}) as Record<string, unknown>;
+      const tboRaw: unknown = lc?.temperature_by_options;
+      // Python: `cfg.get("temperature_by_options") or {}`, then `isinstance(..., dict)`. So a
+      // Python-falsy value is an empty override, a dict is kept, and anything else is rejected
+      // naming the language. isPlainDict is the module's own mapping test, so a Map, Set or Date
+      // is refused instead of being read as {} by Object.entries -- a configured override that
+      // silently does nothing is the same failure as no override at all.
+      if (!isEmptyOverride(tboRaw) && !isPlainDict(tboRaw)) {
+        throw new Error(
+          `Language override ${JSON.stringify(l)} temperature_by_options must be a mapping of ` +
+            `bucket -> float, got ${Array.isArray(tboRaw) ? "list" : typeof tboRaw}`,
+        );
+      }
+      const tboDict: Record<string, unknown> = isPlainDict(tboRaw) ? tboRaw : {};
       this.langTemperatures[normL] = {
         temperature: [0, 1, 2].map((i) => clampTemperature(tRaw[i])),
         temperatureByOptions: Object.fromEntries(
-          Object.entries(tboRaw).map(([k, v]) => [k, clampTemperature(v)]),
+          Object.entries(tboDict).map(([k, v]) => [k, clampTemperature(v)]),
         ),
       };
     }
@@ -436,6 +560,8 @@ export class Agent extends HookRegistry {
       ? [...this.hooks, ...normaliseHooks(opts.hooks, opts.onPredictStart, opts.onPredictEnd)]
       : composeHooks(this.hooks, opts.hooks, opts.onPredictStart, opts.onPredictEnd);
     const raiseErrors = opts.hooksRaise ?? this.hooksRaise;
+    const hooksTimeout = opts.hooksTimeout ?? this.hooksTimeout;
+    const timeoutMs = typeof hooksTimeout === "number" ? hooksTimeout * 1000 : null;
     const ctx = new PredictContext({
       states,
       questions: questions as Record<string, unknown>,
@@ -444,7 +570,7 @@ export class Agent extends HookRegistry {
       headMaxLen: opts.headMaxLen ?? null,
     });
     try {
-      await dispatchAsync(active, "onPredictStart", ctx, { raiseErrors });
+      await dispatchAsync(active, "onPredictStart", ctx, { raiseErrors, timeoutMs });
       if (ctx.results === null) {
         if (!Array.isArray(ctx.states)) {
           throw new TypeError(
@@ -495,7 +621,7 @@ export class Agent extends HookRegistry {
         }
       }
       try {
-        await dispatchAsync(active, "onPredictEnd", ctx, { raiseErrors });
+        await dispatchAsync(active, "onPredictEnd", ctx, { raiseErrors, timeoutMs });
       } catch (hookErr) {
         // End hooks run on the failure path too; do not let one mask the real error.
         if (ctx.error === null) throw hookErr;
@@ -508,7 +634,7 @@ export class Agent extends HookRegistry {
   private _encodeItems(
     state: unknown,
     ids: string[],
-    internals: { t: "choice" | "score" | "noul"; ins: string; crit: unknown }[],
+    internals: InternalQ[],
     maxLen: number,
     headMaxLen: number,
   ): { items: { ids: number[]; markers: number[]; qtype: number }[]; nTokens: number; stats: SequenceStats[] } {
@@ -520,7 +646,7 @@ export class Agent extends HookRegistry {
     for (let qi = 0; qi < ids.length; qi++) {
       const qid = ids[qi];
       const q = internals[qi];
-      const prefix = buildQuestionPrefix(this.tok, q, maxLen, headMaxLen);
+      const prefix = buildQuestionPrefix(this.tok, q, maxLen, headMaxLen, q.optionOrder);
       const seq = sequenceWithState(
         prefix,
         stAll,
@@ -604,7 +730,13 @@ export class Agent extends HookRegistry {
         for (let qi = 0; qi < ids.length; qi++) {
           answers[ids[qi]] = this._decodeRow(
             logits[row] as number[],
-            (act[row] as number[]) ?? [1, 0],
+            // The action head is normalised here, at the model boundary, as `laya/agent.py`'s
+            // `_forward` (agent.py:1329) and `laya/onnx_agent.py` (onnx_agent.py:805) do: the decode
+            // layer's contract -- the Java decoder's `actionProbabilities`, and the `act` rows in
+            // `laya-java/fixtures/decode.json` -- is a probability row. Softmaxing it a second time
+            // inside `_decodeRow` reported 0.6899 for the row `[0.9, 0.1]`, where the reference
+            // reports 0.9.
+            softmax((act[row] as number[]) ?? [1, 0]),
             internals[qi],
             built[s].items[qi].markers.length,
             opts.lang ?? null,
@@ -616,6 +748,10 @@ export class Agent extends HookRegistry {
         // it from the length of the state it sent (issue #174, Python #181 parity).
         const st = built[s].stats;
         const dropped = st.reduce((a, x) => Math.max(a, x.state_tokens_dropped), 0);
+        // Only when a question actually lost options to the head budget, as Python's
+        // `Agent.predict_batch` does: an answer chosen from 42 distinguishable spans of 58 has a
+        // ceiling the caller cannot otherwise see.
+        const collapsed = collapsedOptions(ids, st);
         out.push({
           model: "laya-rl-agent",
           answers,
@@ -626,6 +762,7 @@ export class Agent extends HookRegistry {
             state_tokens_dropped: dropped,
             truncated: dropped > 0,
             truncated_questions: ids.filter((_, qi) => st[qi].truncated),
+            ...(Object.keys(collapsed).length ? { options: collapsed } : {}),
           },
         });
       }
@@ -633,11 +770,15 @@ export class Agent extends HookRegistry {
     return out;
   }
 
-  /** Decode one head row into the answer for its question. */
+  /**
+   * Decode one head row into the answer for its question. `actRow` is the model boundary's
+   * normalised action-probability row, so its first entry is the reported `act_probability` --
+   * exactly what `Agent._decode_answers` reads as `act[r, 0]`.
+   */
   private _decodeRow(
     logitsRow: number[],
     actRow: number[],
-    q: { t: "choice" | "score" | "noul"; ins: string; crit: unknown },
+    q: InternalQ,
     k: number,
     lang: string | null = null,
   ): SystemAnswer {
@@ -651,12 +792,24 @@ export class Agent extends HookRegistry {
       ? (langCfg.temperatureByOptions[bucket] ?? langCfg.temperature[qt] ?? 1.0)
       : (this.temperatureByOptions[bucket] ?? this.temperature[qt] ?? 1.0);
     const z = logitsRow.slice(0, k).map((v) => v / scale);
-    const p = softmax(z);
-    const actP = softmax(actRow.slice(0, Math.max(2, actRow.length)));
-    const ext = { act_probability: r4(actP[0]) };
+    // The row comes back in slot order and everything below indexes by option, so invert it
+    // here -- `p.argmax()`/`keys[best]`, `i * p[i]` and `p[1]` are all option-indexed. Same
+    // position as `laya/agent.py:1350`, immediately after the softmax.
+    const p = unpermuteProbs(softmax(z), q.optionOrder);
+    // Read, not re-normalised: the row arrives as probabilities. The `slice(0, Math.max(2, ...))`
+    // this replaces could only pad an Act row that validation had already refused for being empty.
+    const ext = { act_probability: r4(actRow[0]) };
     // Same quantity on every question type (max(p)), so callers can gate across types on
     // one number; `confidence` stays as-is for existing callers (entropy for choice/score).
-    const ansConf = r4(answerConfidence(p));
+    // Histogram-binning recalibration (issue #871, Python parity) recalibrates ans_raw
+    // per temp_bucket unless a language override is active.
+    const ansRaw = answerConfidence(p);
+    const langOverride = Boolean(lang && lang.split("-")[0].toLowerCase() in this.langTemperatures);
+    const ansConf = r4(
+      this.binningMap && !langOverride
+        ? applyBinningMap(ansRaw, bucket, this.binningMap)
+        : ansRaw,
+    );
     if (q.t === "choice") {
       const keys = Object.keys(q.crit as Record<string, unknown>);
       let best = 0;
@@ -748,6 +901,31 @@ export class Agent extends HookRegistry {
     opts: DecideOptions & PredictOptions = {},
   ): Promise<Record<string, unknown> | DecisionResult> {
     return decide(this, state, schema, opts);
+  }
+
+  /**
+   * Answer many states against one schema in one batched call, in input order.
+   *
+   * The throughput form of `decide`: the schema is planned once and evaluated
+   * over every state through `predictBatch` (shared forward passes, results in input order).
+   * See `structured.ts`.
+   */
+  async decideBatch(
+    states: unknown[],
+    schema: unknown,
+    opts: DecideBatchOptions & PredictOptions & { returnDetails: true },
+  ): Promise<DecisionResult[]>;
+  async decideBatch(
+    states: unknown[],
+    schema?: unknown,
+    opts?: DecideBatchOptions & PredictOptions,
+  ): Promise<Record<string, unknown>[]>;
+  async decideBatch(
+    states: unknown[],
+    schema?: unknown,
+    opts: DecideBatchOptions & PredictOptions = {},
+  ): Promise<Record<string, unknown>[] | DecisionResult[]> {
+    return decideBatch(this, states, schema, opts);
   }
 
   static async load(

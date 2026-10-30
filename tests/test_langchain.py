@@ -226,6 +226,7 @@ def mock_router_response(state, questions):
                 "choice": choice,
                 "probabilities": {"billing": conf, "technical": 1.0 - conf},
                 "confidence": conf,
+                "answer_confidence": conf,
             }
         },
     }
@@ -530,6 +531,36 @@ check("batch/router last_decision",
 check("batch/router empty inputs", batch_router_node.batch([]), [])
 check("batch/router empty skips the runner", len(batch_agent.batch_calls), 1)
 
+# batch() must forward `lang` and `min_confidence` the same way invoke() does, or the two paths
+# answer differently for a runnable configured with them. Agent convention: both are call kwargs.
+_crit = {"billing": "invoices, refunds", "technical": "bugs, errors"}
+ba_ctrl = MockBatchAgent(mock_router_response)
+LayaRouter(criteria=_crit, agent=ba_ctrl, lang="de", min_confidence=0.4).batch(ROUTER_INPUTS)
+check("batch/agent forwards lang", ba_ctrl.batch_calls[0]["kwargs"].get("lang"), "de")
+check("batch/agent forwards min_confidence", ba_ctrl.batch_calls[0]["kwargs"].get("min_confidence"), 0.4)
+
+# Router convention: lang rides on each request item; min_confidence is a call-level argument.
+rl_ctrl = MockRouterLike(mock_router_response)
+LayaRouter(criteria=_crit, agent=rl_ctrl, lang="de", min_confidence=0.4).batch(ROUTER_INPUTS)
+_reqs = rl_ctrl.batch_calls[0]["requests"]
+_kw = rl_ctrl.batch_calls[0]["kwargs"]
+check("batch/router item carries lang", all(r.get("lang") == "de" for r in _reqs), True)
+check("batch/router min_confidence is call-level", _kw.get("min_confidence"), 0.4)
+check("batch/router min_confidence not duplicated onto items",
+      any("min_confidence" in r for r in _reqs), False)
+check("batch/router lang not duplicated as a call kwarg", "lang" in _kw, False)
+
+# min_confidence=0.0 is a real gate (abstain over nothing), not an absence -- it must survive batch.
+ba_zero = MockBatchAgent(mock_router_response)
+LayaRouter(criteria=_crit, agent=ba_zero, min_confidence=0.0).batch(ROUTER_INPUTS)
+check("batch/agent keeps min_confidence=0.0", ba_zero.batch_calls[0]["kwargs"].get("min_confidence"), 0.0)
+# and an unset control stays unset -- no lang/min_confidence keys leak in
+ba_none = MockBatchAgent(mock_router_response)
+LayaRouter(criteria=_crit, agent=ba_none).batch(ROUTER_INPUTS)
+check("batch/agent omits unset controls",
+      ("lang" in ba_none.batch_calls[0]["kwargs"]) or ("min_confidence" in ba_none.batch_calls[0]["kwargs"]),
+      False)
+
 # LangChain hands batch() one config, a list of per-input configs (what RunnableSequence
 # and RunnableParallel do), or None. All three must reach the same outputs.
 one_config = {"tags": ["t"], "max_concurrency": 2}
@@ -822,6 +853,166 @@ try:
 finally:
     langchain_module._get_default_router = _real_default_router
 
+# --------------------------------------------------------------- 6b. LayaDecision per-call controls
+#
+# The other four nodes route through `_execute_decision`, which has forwarded the two token
+# budgets (#530) and the five hook arguments (#532) since they landed. `LayaDecision` bypasses
+# that executor and calls `decide` directly, so it historically forwarded only `model`: a schema
+# decision could not widen its own window or attach the cache/audit hook its siblings can. These
+# checks drive the whole control family through the bypass and read it back off the runner.
+import inspect  # noqa: E402
+from laya.agent import Agent  # noqa: E402
+from laya.integrations import _controls  # noqa: E402
+from laya.router import Router  # noqa: E402
+
+DECISION_ALL_CONTROLS = {"max_len": 1024, "head_max_len": 512, "hooks": ["H"],
+                         "on_predict_start": "S", "on_predict_end": "E",
+                         "hooks_raise": True, "hooks_timeout": 0.5}
+
+_dplain = RecordingAgent()
+LayaDecision(DECISION_SCHEMA, agent=_dplain).invoke("x")
+check("decision/controls default sends nothing", _dplain.calls[0]["kwargs"], {})
+
+_devery = RecordingAgent()
+LayaDecision(DECISION_SCHEMA, agent=_devery, **DECISION_ALL_CONTROLS).invoke("x")
+check("decision/controls forwards every control", _devery.calls[0]["kwargs"],
+      DECISION_ALL_CONTROLS)
+
+_dbudget = RecordingAgent()
+LayaDecision(DECISION_SCHEMA, agent=_dbudget, head_max_len=256).invoke("x")
+check("decision/controls forwards one budget alone", _dbudget.calls[0]["kwargs"],
+      {"head_max_len": 256})
+
+# 0 and [] are decisions, not absences: a truthiness test would silently drop them.
+_dfalsy = RecordingAgent()
+LayaDecision(DECISION_SCHEMA, agent=_dfalsy, head_max_len=0, hooks=[], hooks_raise=False).invoke("x")
+check("decision/controls keeps falsy values", _dfalsy.calls[0]["kwargs"],
+      {"head_max_len": 0, "hooks": [], "hooks_raise": False})
+
+_dmixed = RecordingAgent()
+LayaDecision(DECISION_SCHEMA, agent=_dmixed, model="laya-multilingual", max_len=1024).invoke("x")
+check("decision/controls alongside model", _dmixed.calls[0]["kwargs"],
+      {"model": "laya-multilingual", "max_len": 1024})
+
+# The two routing hints join that family: the node reads them and `decide` forwards them to
+# `predict`, so a schema decision picks its own checkpoint the way its siblings do.
+# `RecordingAgent.predict` is a `**kwargs` sink, so what it records is exactly the set the node
+# sent -- an unset hint has to be absent, not sent as `None`, which would replace the deployment's
+# own `Router(task=...)` hint with nothing for this one call.
+_dhint = RecordingAgent()
+LayaDecision(DECISION_SCHEMA, agent=_dhint).invoke("x")
+check("decision/controls routing default sends nothing", _dhint.calls[0]["kwargs"], {})
+
+_dboth = RecordingAgent()
+LayaDecision(DECISION_SCHEMA, agent=_dboth, task="typed-decisions", lang_guess="de").invoke("x")
+check("decision/controls forwards both hints", _dboth.calls[0]["kwargs"],
+      {"task": "typed-decisions", "lang_guess": "de"})
+
+_done = RecordingAgent()
+LayaDecision(DECISION_SCHEMA, agent=_done, lang_guess="").invoke("x")
+check("decision/controls keeps an empty lang_guess", _done.calls[0]["kwargs"],
+      {"lang_guess": ""})
+
+_dhintmix = RecordingAgent()
+LayaDecision(DECISION_SCHEMA, agent=_dhintmix, max_len=1024, hooks=[],
+             task="typed-decisions").invoke("x")
+check("decision/controls hints beside budget and hooks", _dhintmix.calls[0]["kwargs"],
+      {"max_len": 1024, "hooks": [], "task": "typed-decisions"})
+
+
+class _StrictDecisionAgent:
+    """An `Agent`-shaped runner: the budgets yes, either routing hint never.
+
+    A declared signature rather than `**kwargs`, because what this checks is the *name* a hint
+    arrives under -- a sink records anything, including one this node should have refused.
+    """
+
+    def __init__(self):
+        self.seen = None
+
+    def predict(self, state, questions, max_len=None, head_max_len=None):
+        self.seen = {"max_len": max_len, "head_max_len": head_max_len}
+        return {"model": "mock", "answers": dict(DECISION_ANSWERS)}
+
+
+# Handing a routing hint to a runner with no routing step is the one thing the node must not do
+# silently: core would raise `TypeError` past every hook on the way to an answer that ignores the
+# hint, and dropping it quietly is the silence this whole module exists to break.
+for _hint, _sample in zip(_controls.ROUTER_ONLY_CONTROLS, ("typed-decisions", "de")):
+    _strict = _StrictDecisionAgent()
+    _raised, _message = False, ""
+    try:
+        LayaDecision(DECISION_SCHEMA, agent=_strict, **{_hint: _sample}).invoke("x")
+    except ValueError as _exc:
+        _raised, _message = True, str(_exc)
+    check_true("decision/controls refuses %s at a runner that cannot route" % _hint, _raised)
+    check_true("decision/controls %s names itself" % _hint, _hint in _message)
+    check_true("decision/controls %s names the call that refused" % _hint,
+               "_StrictDecisionAgent.predict" in _message)
+    check_true("decision/controls %s says what to do instead" % _hint, "Router" in _message)
+    check("decision/controls %s refusal happens before the call" % _hint, _strict.seen, None)
+
+# The names it reads out of the shared module are the names it actually forwards -- a control
+# added to `._controls` without reaching this bypass fails here rather than being dropped silently.
+check("decision/controls reads both budgets", set(_controls.PREDICT_CONTROLS),
+      {"max_len", "head_max_len"})
+_dag = set(inspect.signature(Agent.system_one).parameters)
+_dr = set(inspect.signature(Router.predict).parameters)
+for _c in DECISION_ALL_CONTROLS:
+    check_true("decision/controls/%s accepted by Agent" % _c, _c in _dag)
+    check_true("decision/controls/%s accepted by Router.predict" % _c, _c in _dr)
+
+# Remote mode: the two budgets travel in the request body; a hook is a Python callable that runs
+# inside `predict` and no wire format carries it, so refuse rather than report a success that
+# never called it.
+_dremote = []
+
+
+def _dspy_remote(base_url, state, questions, api_key=None, model=None, **extras):
+    _dremote.append(dict({"model": model}, **extras))
+    return {"model": "mock", "answers": dict(DECISION_ANSWERS)}
+
+
+_dreal = langchain_module._call_remote
+langchain_module._call_remote = _dspy_remote
+try:
+    LayaDecision(DECISION_SCHEMA, base_url="http://laya:8000",
+                 max_len=1024, head_max_len=384).invoke("x")
+    check("decision/remote forwards both budgets", _dremote[-1],
+          {"model": None, "max_len": 1024, "head_max_len": 384})
+    LayaDecision(DECISION_SCHEMA, base_url="http://laya:8000").invoke("x")
+    check("decision/remote omits an unset budget", _dremote[-1], {"model": None})
+    # Both routing hints are laya-serve body controls too, so they ride in the same JSON, and a
+    # blank `lang_guess` is core's documented "fall through to detection" rather than an absence.
+    LayaDecision(DECISION_SCHEMA, base_url="http://laya:8000",
+                 task="typed-decisions", lang_guess="de").invoke("x")
+    check("decision/remote body carries both hints", _dremote[-1],
+          {"model": None, "task": "typed-decisions", "lang_guess": "de"})
+    LayaDecision(DECISION_SCHEMA, base_url="http://laya:8000", lang_guess="").invoke("x")
+    check("decision/remote body keeps an empty lang_guess", _dremote[-1],
+          {"model": None, "lang_guess": ""})
+    # Only the code string has a wire form: serve answers 422 to a callable, so refuse the callable
+    # here rather than after the request has already gone out.
+    _dcallable, _dcallable_message = False, ""
+    try:
+        LayaDecision(DECISION_SCHEMA, base_url="http://laya:8000",
+                     lang_guess=lambda state: "de").invoke("x")
+    except ValueError as exc:
+        _dcallable, _dcallable_message = True, str(exc)
+    check_true("decision/remote refuses a callable lang_guess", _dcallable)
+    check_true("decision/remote callable lang_guess names itself",
+               "lang_guess" in _dcallable_message)
+    check_true("decision/remote callable lang_guess names the endpoint",
+               "laya-serve" in _dcallable_message)
+    _drefused = False
+    try:
+        LayaDecision(DECISION_SCHEMA, base_url="http://laya:8000", hooks=[object()]).invoke("x")
+    except ValueError as exc:
+        _drefused = "hooks" in str(exc) and "laya-serve" in str(exc)
+    check_true("decision/remote refuses a hook", _drefused)
+finally:
+    langchain_module._call_remote = _dreal
+
 # A pydantic model is a schema too, so the same class can type a chain and a call site. Note
 # `Literal[0, 1, 2]` plans as an enum choice rather than a score scale, so the answer carries a
 # label and the value comes back as the schema's own int.
@@ -992,6 +1183,120 @@ finally:
     langchain_module.urllib.request.build_opener = _real_build_opener
 
 
+# --------------------------------------------------------------- 7b. Per-request lang / abstention
+#
+# `lang` and `min_confidence` are core's language routing and abstention gate (#361). Both are
+# read by `Agent.predict`/`system_one` AND `Router.predict`, and both are laya-serve
+# `BODY_CONTROLS`, so they are safe to forward on the local and the remote path alike -- unlike
+# `task` / `lang_guess`, which are Router-only. A wrapper that drops them cannot route a
+# non-English state or measure the abstention gate it is supposed to honor.
+from laya.integrations import _controls  # noqa: E402
+import inspect  # noqa: E402
+from laya.agent import Agent  # noqa: E402
+from laya.router import Router  # noqa: E402
+
+DECISION_CRITERIA = {"billing": "invoices", "tech": "bugs"}
+DECISION_NODES = (
+    ("router", lambda a, **kw: LayaRouter(DECISION_CRITERIA, agent=a, **kw)),
+    ("guardrail", lambda a, **kw: LayaGuardrail(
+        questions={"jailbreak": {"type": "noul", "instructions": "jailbreak?"}}, agent=a, **kw)),
+    ("triage", lambda a, **kw: LayaTriage(agent=a, **kw)),
+    ("evaluator", lambda a, **kw: LayaEvaluator(
+        questions={"faithful": {"type": "noul", "instructions": "faithful?"}}, agent=a, **kw)),
+)
+
+check("decision/_controls names the tuple", _controls.DECISION_CONTROLS, ("lang", "min_confidence"))
+for _c in _controls.DECISION_CONTROLS:
+    check_true("decision/%s accepted by Agent.system_one" % _c,
+               _c in set(inspect.signature(Agent.system_one).parameters))
+    check_true("decision/%s accepted by Router.predict" % _c,
+               _c in set(inspect.signature(Router.predict).parameters))
+
+for name, build in DECISION_NODES:
+    plain = BudgetAgent()
+    build(plain).invoke("some state")
+    check("decision/%s default sends nothing" % name, plain.kwargs[0], {})
+
+    both = BudgetAgent()
+    build(both, lang="fr", min_confidence=0.4).invoke("some state")
+    check("decision/%s forwards both" % name, both.kwargs[0],
+          {"lang": "fr", "min_confidence": 0.4})
+
+    # Each knob works alone; an override built from one must not carry the other.
+    one = BudgetAgent()
+    build(one, lang="es").invoke("some state")
+    check("decision/%s forwards lang alone" % name, one.kwargs[0], {"lang": "es"})
+
+    # A 0.0 abstention gate is a real decision ("abstain over nothing"), not an absence.
+    zero = BudgetAgent()
+    build(zero, min_confidence=0.0).invoke("some state")
+    check("decision/%s keeps min_confidence=0.0" % name, zero.kwargs[0], {"min_confidence": 0.0})
+
+    mixed = BudgetAgent()
+    build(mixed, model="laya-multilingual", lang="de").invoke("some state")
+    check("decision/%s with model" % name, mixed.kwargs[0],
+          {"model": "laya-multilingual", "lang": "de"})
+
+
+# A remote node forwards them in the request body instead of dropping them.
+decision_remote_calls = []
+_decision_real_call_remote = langchain_module._call_remote
+
+
+def decision_spy_call_remote(base_url, state, questions, api_key=None, model=None, **extras):
+    decision_remote_calls.append(dict({"model": model}, **extras))
+    return {"answers": {"route": {"type": "choice", "choice": "billing", "confidence": 0.9}}}
+
+
+langchain_module._call_remote = decision_spy_call_remote
+try:
+    for field, value in (("lang", "it"), ("min_confidence", 0.25), ("min_confidence", 0.0)):
+        LayaRouter(DECISION_CRITERIA, base_url="http://laya:8000", **{field: value}).invoke("x")
+        check("decision/remote forwards %s=%r" % (field, value), decision_remote_calls[-1],
+              {"model": None, field: value})
+    # Nothing set sends nothing.
+    LayaRouter(DECISION_CRITERIA, base_url="http://laya:8000").invoke("x")
+    check_true("decision/remote omits unset decision controls",
+               not any(k in decision_remote_calls[-1] for k in _controls.DECISION_CONTROLS),
+               repr(decision_remote_calls[-1]))
+finally:
+    langchain_module._call_remote = _decision_real_call_remote
+
+# ...and the real `_call_remote` writes them into the JSON body.
+_decision_sent = {}
+
+
+class _DecisionFakeResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b'{"answers": {}}'
+
+
+class _DecisionFakeOpener:
+    def open(self, req, timeout=None):
+        _decision_sent["body"] = json.loads(req.data.decode("utf-8"))
+        return _DecisionFakeResponse()
+
+
+_decision_real_build_opener = langchain_module.urllib.request.build_opener
+langchain_module.urllib.request.build_opener = lambda *a, **k: _DecisionFakeOpener()
+try:
+    langchain_module._call_remote("http://laya:8000", "x", {}, lang="fr", min_confidence=0.0)
+    check("decision/_call_remote sends lang", _decision_sent["body"].get("lang"), "fr")
+    check("decision/_call_remote keeps min_confidence=0.0",
+          _decision_sent["body"].get("min_confidence"), 0.0)
+    langchain_module._call_remote("http://laya:8000", "x", {})
+    check_true("decision/_call_remote omits unset decision controls",
+               "lang" not in _decision_sent["body"] and "min_confidence" not in _decision_sent["body"])
+finally:
+    langchain_module.urllib.request.build_opener = _decision_real_build_opener
+
+
 # --------------------------------------------------------------- 7. Prediction hooks
 from laya.integrations import langchain as langchain_module  # noqa: E402
 from laya.hooks import PredictContext  # noqa: E402
@@ -1070,6 +1375,37 @@ for param in ALL_HOOK_KWARGS:
     check_true("hooks/%s is an Agent.predict parameter" % param, param in agent_params)
     check_true("hooks/%s is a Router.predict parameter" % param, param in router_params)
 
+
+# --------------------------------------------------------------- 7c. The control family, derived
+#
+# `laya/integrations/_controls.py` says the shared tuples are checked by this suite and that this
+# suite asserts every wrapper's constructor accepts all of them. The two literals above name the
+# controls by copying them, so neither half happens here: tests/test_crewai.py and
+# tests/test_llamaindex.py read their control set out of the module, which makes a control added
+# there fail those suites, while the copies here keep their old five and seven names and this suite
+# stays green while the new control is dropped at every LangChain entry point. Derive the union and
+# pin it against both the copies and the constructors.
+CONTROLS = (tuple(_controls.PREDICT_CONTROLS) + tuple(_controls.DECISION_CONTROLS)
+            + tuple(_controls.HOOK_CONTROLS))
+
+check("controls/ALL_HOOK_KWARGS covers HOOK_CONTROLS",
+      set(ALL_HOOK_KWARGS), set(_controls.HOOK_CONTROLS))
+check("controls/DECISION_ALL_CONTROLS covers the bypass family", set(DECISION_ALL_CONTROLS),
+      set(_controls.PREDICT_CONTROLS) | set(_controls.HOOK_CONTROLS))
+
+for cls in (LayaRouter, LayaGuardrail, LayaTriage, LayaEvaluator):
+    init_params = set(inspect.signature(cls.__init__).parameters)
+    for _c in CONTROLS:
+        check_true("controls/%s takes %s" % (cls.__name__, _c), _c in init_params)
+
+# `LayaDecision` bypasses `_execute_decision` and calls `decide` directly, so it is driven by its
+# own seven-name literal rather than the union; the two `DECISION_CONTROLS` it omits are a gap in
+# the wrapper, not in this list.
+for _c in tuple(_controls.PREDICT_CONTROLS) + tuple(_controls.HOOK_CONTROLS):
+    check_true("controls/LayaDecision takes %s" % _c,
+               _c in set(inspect.signature(LayaDecision.__init__).parameters))
+
+
 class Watcher:
     """A minimal lifecycle hook; only its identity matters to the node under test."""
 
@@ -1121,6 +1457,586 @@ try:
     check("hooks/remote made no extra call", len(remote_hook_calls), 1)
 finally:
     langchain_module._call_remote = _real_call_remote
+
+
+# ------------------------------------ 8. The two Router-only routing hints, on every entry point
+from laya.integrations import _controls as controls_module  # noqa: E402
+
+ROUTER_HINTS = tuple(controls_module.ROUTER_ONLY_CONTROLS)
+
+# The tuples name the arguments their builders accept, in both directions.
+check("routing/routing tuple names router_kwargs",
+      set(inspect.signature(controls_module.router_kwargs).parameters), set(ROUTER_HINTS))
+
+# A `Router` reads both hints and an `Agent` -- which has no routing step to read them in -- reads
+# neither, so the wrapper's rule (forward at one, refuse by name at the other) is only correct
+# while these two lines hold. Read from core, not from a comment: if `Agent.predict` ever gains
+# `task`, the refusals below stop being right, and this is what says so.
+for _c in ROUTER_HINTS:
+    check_true("routing/%s is a Router.predict parameter" % _c, _c in router_params)
+    check_true("routing/%s is not an Agent.predict parameter" % _c, _c not in agent_params)
+
+ROUTING_ANSWER = {"model": "mock", "answers": {
+    "route": {"type": "choice", "choice": "billing", "confidence": 0.9, "probabilities": {}}}}
+
+
+class RoutingRunner:
+    """A Router-shaped runner: it declares the arguments core's `Router.predict` declares.
+
+    Explicit parameters rather than `**kwargs`, because what this section checks is the *name* a
+    hint arrives under -- a `**kwargs` sink records anything, including one that arrived misspelled
+    or in the wrong slot.
+    """
+
+    def __init__(self):
+        self.seen = {}
+
+    def predict(self, state, questions, model=None, task=None, lang=None, lang_guess=None,
+                max_len=None, head_max_len=None):
+        self.seen = {k: v for k, v in locals().items()
+                     if v is not None and k not in ("self", "state", "questions")}
+        return dict(ROUTING_ANSWER)
+
+
+class NonRoutingRunner(RoutingRunner):
+    """An Agent-shaped runner: the budgets yes, either routing hint never."""
+
+    def predict(self, state, questions, max_len=None, head_max_len=None):
+        return RoutingRunner.predict(self, state, questions, max_len=max_len,
+                                     head_max_len=head_max_len)
+
+
+check_true("routing/RoutingRunner declares only accepted arguments",
+           (set(inspect.signature(RoutingRunner.predict).parameters)
+            - {"self", "state", "questions"}) <= router_params)
+check_true("routing/NonRoutingRunner declares only accepted arguments",
+           (set(inspect.signature(NonRoutingRunner.predict).parameters)
+            - {"self", "state", "questions"}) <= agent_params)
+
+# Every node in the family, built around a runner of choosing.
+def _routing_seen(build, runner_cls, **hints):
+    runner = runner_cls()
+    build(runner, **hints).invoke("some state")
+    return runner.seen
+
+
+for name, build in HOOK_NODES:
+    check("routing/%s default sends nothing" % name, _routing_seen(build, RoutingRunner), {})
+    check("routing/%s forwards both hints" % name,
+          _routing_seen(build, RoutingRunner, task="typed_decisions", lang_guess="de"),
+          {"task": "typed_decisions", "lang_guess": "de"})
+    check("routing/%s forwards one hint alone" % name,
+          _routing_seen(build, RoutingRunner, lang_guess="de"), {"lang_guess": "de"})
+    # A blank hint is core's documented "no usable hint, fall through to detection" -- a value the
+    # caller chose, so it must survive rather than drop out as if unset.
+    check("routing/%s keeps an empty lang_guess" % name,
+          _routing_seen(build, RoutingRunner, lang_guess=""), {"lang_guess": ""})
+    check("routing/%s beside model and budget" % name,
+          _routing_seen(build, RoutingRunner, model="laya-multilingual", max_len=1024,
+                        task="typed_decisions"),
+          {"model": "laya-multilingual", "max_len": 1024, "task": "typed_decisions"})
+
+    # A runner with no routing step must not be handed a routing hint. Forwarding it is a
+    # `TypeError` raised inside core, past every hook, on the way to an answer nobody asked for;
+    # dropping it is the silence this whole module exists to break.
+    for _c, _sample in zip(ROUTER_HINTS, ("typed_decisions", "de")):
+        raised, message = False, ""
+        try:
+            _routing_seen(build, NonRoutingRunner, **{_c: _sample})
+        except ValueError as e:
+            raised, message = True, str(e)
+        check_true("routing/%s refuses %s at a runner that cannot route" % (name, _c), raised)
+        check_true("routing/%s %s names itself" % (name, _c), _c in message)
+        check_true("routing/%s %s names the call that refused" % (name, _c),
+                   "NonRoutingRunner.predict" in message)
+        check_true("routing/%s %s says what to do instead" % (name, _c), "Router" in message)
+
+    # The refusal happens before the runner is called, so a hint that cannot be honoured cannot
+    # also carry a partially-applied call with it.
+    strict = NonRoutingRunner()
+    try:
+        build(strict, task="typed_decisions").invoke("some state")
+    except ValueError:
+        pass
+    check("routing/%s refusal happens before the call" % name, strict.seen, {})
+
+# Each constructor has to accept both names, or the forwarding checks are vacuous: `extra` is
+# "allow" on these runnables, so a parameter the class forgot is still accepted at construction,
+# still reads back as a normal attribute, and is still dropped at the call. That is the shape of
+# the bug this section closes, and why declaring the field is checked separately from storing it.
+# `LayaDecision` is here for the same reason as the four, and drives the hints through its own
+# bypass in section 6b rather than through the `build(...)` factories below.
+for cls in (LayaRouter, LayaGuardrail, LayaTriage, LayaEvaluator, LayaDecision):
+    for _c in ROUTER_HINTS:
+        check_true("routing/%s __init__ takes %s" % (cls.__name__, _c),
+                   _c in inspect.signature(cls.__init__).parameters)
+        check_true("routing/%s declares %s as a field" % (cls.__name__, _c),
+                   _c in cls.__annotations__)
+
+# The remote path: both hints are laya-serve body controls, so they ride in the JSON, and a blank
+# one stays in it. `LayaDecision` bypasses `_execute_decision` and calls `laya.decide` against a
+# schema, so its own remote body is checked in section 6b.
+remote_routing_calls = []
+_real_remote = langchain_module._call_remote
+
+
+def routing_spy_call_remote(base_url, state, questions, api_key=None, model=None, **extras):
+    remote_routing_calls.append(extras)
+    return {"answers": {"route": {"type": "choice", "choice": "billing", "confidence": 0.9}}}
+
+
+REMOTE_NODES = (
+    ("router", lambda **kw: LayaRouter(HOOK_CRITERIA, base_url="http://laya:8000", **kw)),
+    ("guardrail", lambda **kw: LayaGuardrail(questions=HOOK_QUESTIONS,
+                                             base_url="http://laya:8000", **kw)),
+    ("triage", lambda **kw: LayaTriage(base_url="http://laya:8000", **kw)),
+    ("evaluator", lambda **kw: LayaEvaluator(
+        questions={"faithful": {"type": "noul", "instructions": "faithful?"}},
+        base_url="http://laya:8000", **kw)),
+)
+
+langchain_module._call_remote = routing_spy_call_remote
+try:
+    for name, build in REMOTE_NODES:
+        remote_routing_calls.clear()
+        build().invoke("some state")
+        check("routing/%s remote sends nothing by default" % name, remote_routing_calls[-1], {})
+
+        remote_routing_calls.clear()
+        build(task="typed_decisions", lang_guess="de").invoke("some state")
+        check("routing/%s remote body carries both hints" % name, remote_routing_calls[-1],
+              {"task": "typed_decisions", "lang_guess": "de"})
+
+        remote_routing_calls.clear()
+        build(lang_guess="").invoke("some state")
+        check("routing/%s remote body keeps an empty lang_guess" % name,
+              remote_routing_calls[-1], {"lang_guess": ""})
+
+        # A `lang_guess` may also be a callable taking the state, and only the code string has a
+        # wire form: `laya-serve` validates it as a string and answers 422 to anything else, so the
+        # callable would fail as an HTTP status after the request had already gone out.
+        raised, message = False, ""
+        try:
+            build(lang_guess=lambda state: "de").invoke("some state")
+        except ValueError as e:
+            raised, message = True, str(e)
+        check_true("routing/%s remote refuses a callable lang_guess" % name, raised)
+        check_true("routing/%s callable lang_guess names itself" % name, "lang_guess" in message)
+        check_true("routing/%s callable lang_guess names the endpoint" % name,
+                   "laya-serve" in message)
+    check("routing/remote made no call for a refused hint", len(remote_routing_calls), 1)
+finally:
+    langchain_module._call_remote = _real_remote
+
+# The real `_call_remote` has to put them in the JSON body, not merely accept the keywords.
+_routing_sent = {}
+
+
+class _RoutingFakeOpener:
+    def open(self, req, timeout=None):
+        _routing_sent["body"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse()
+
+
+_real_opener = langchain_module.urllib.request.build_opener
+langchain_module.urllib.request.build_opener = lambda *a, **k: _RoutingFakeOpener()
+try:
+    langchain_module._call_remote("http://laya:8000", "x", {}, task="typed_decisions",
+                                  lang_guess="de")
+    check("routing/_call_remote body carries task", _routing_sent["body"].get("task"),
+          "typed_decisions")
+    check("routing/_call_remote body carries lang_guess",
+          _routing_sent["body"].get("lang_guess"), "de")
+    langchain_module._call_remote("http://laya:8000", "x", {})
+    check_true("routing/_call_remote omits unset hints",
+               "task" not in _routing_sent["body"] and "lang_guess" not in _routing_sent["body"])
+finally:
+    langchain_module.urllib.request.build_opener = _real_opener
+
+
+# The batch entry points, which reach core through a different door: a `Router` gets one request
+# dict per state and `route_batch` hands each dict's hints to `route`, while an `Agent` gets the
+# hints as call arguments it does not take. Both are checked at the signature of that door.
+class RoutingRouterLike(MockRouterLike):
+    """Router-shaped, and it declares `route` the way core does: hints in, no `**kwargs`."""
+
+    def __init__(self, response_fn):
+        super().__init__(response_fn)
+        self.routed = []
+
+    def route(self, state, questions, model=None, task=None, lang=None, lang_guess=None):
+        self.routed.append({k: v for k, v in locals().items()
+                            if v is not None and k not in ("self", "state", "questions")})
+        return {"model": "english"}
+
+
+class NonRoutingBatchAgent(MockBatchAgent):
+    """`predict_batch(states, questions, ...)` with core's Agent argument list -- no hints."""
+
+    def predict_batch(self, states, questions, batch_size=None, lang=None, max_len=None,
+                      head_max_len=None, sort_by_length=False):
+        return super().predict_batch(states, questions, batch_size=batch_size, lang=lang,
+                                     max_len=max_len, head_max_len=head_max_len,
+                                     sort_by_length=sort_by_length)
+
+
+check_true("routing/RoutingRouterLike.route declares only accepted arguments",
+           (set(inspect.signature(RoutingRouterLike.route).parameters)
+            - {"self", "state", "questions"}) <= set(inspect.signature(Router.route).parameters))
+
+_router_shape = RoutingRouterLike(mock_router_response)
+_node = LayaRouter(HOOK_CRITERIA, agent=_router_shape, task="typed_decisions", lang_guess="de")
+check("routing/batch on a Router shapes the answers", _node.batch(ROUTER_INPUTS),
+      [_node.invoke(text) for text in ROUTER_INPUTS])
+check("routing/batch Router carries both hints per request",
+      {k: v for k, v in _router_shape.batch_calls[-1]["requests"][0].items()
+       if k in ROUTER_HINTS},
+      {"task": "typed_decisions", "lang_guess": "de"})
+
+_plain_shape = RoutingRouterLike(mock_router_response)
+LayaRouter(HOOK_CRITERIA, agent=_plain_shape).batch(ROUTER_INPUTS)
+check("routing/batch Router sends nothing by default",
+      [{k: v for k, v in request.items() if k in ROUTER_HINTS}
+       for request in _plain_shape.batch_calls[-1]["requests"]],
+      [{} for _ in ROUTER_INPUTS])
+
+_agent_shape = NonRoutingBatchAgent(mock_router_response)
+try:
+    LayaRouter(HOOK_CRITERIA, agent=_agent_shape, task="typed_decisions").batch(ROUTER_INPUTS)
+    check_true("routing/batch refuses task at a runner that cannot route", False, "no error raised")
+except ValueError as e:
+    check_true("routing/batch refuses task at a runner that cannot route", True)
+    check_true("routing/batch refusal names the batch entry point",
+               "NonRoutingBatchAgent.predict_batch" in str(e), str(e))
+    check("routing/batch refusal made no call", _agent_shape.batch_calls, [])
+
+# A duck-typed batch runner that takes `**kwargs` is not refused: this module cannot tell what it
+# reads, and refusing on a guess would block a call that works.
+_kwargs_batch = MockBatchAgent(mock_router_response)
+LayaRouter(HOOK_CRITERIA, agent=_kwargs_batch, task="typed_decisions").batch(ROUTER_INPUTS)
+check("routing/batch forwards to a **kwargs runner",
+      _kwargs_batch.batch_calls[-1]["kwargs"].get("task"), "typed_decisions")
+
+
+class RouteIgnoringHintsRouter(MockRouterLike):
+    """Router-shaped, but its routing step reads neither hint.
+
+    This is the witness that the Router batch path asks about the door the hints actually go
+    through: `predict_batch(requests)` takes no routing argument at all and would accept anything,
+    so checking that signature instead of `route`'s would forward in silence.
+    """
+
+    def route(self, state, questions, model=None, lang=None):
+        return {"model": "english"}
+
+
+_hints_free_router = RouteIgnoringHintsRouter(mock_router_response)
+try:
+    LayaRouter(HOOK_CRITERIA, agent=_hints_free_router, task="typed_decisions").batch(
+        ROUTER_INPUTS)
+    check_true("routing/batch Router asks about route", False, "no error raised")
+except ValueError as exc:
+    check_true("routing/batch Router asks about route",
+               "RouteIgnoringHintsRouter.route" in str(exc), str(exc))
+
+
+# The `docs/langchain.md` "What the hint moves, measured" table, re-run against the live router.
+# Routing only: `route` decides without loading a checkpoint, so this costs no weights and no
+# forward pass. The assertion is the guarantee the hint gives -- a caller that says "de" gets the
+# multilingual checkpoint for every one of these. The no-hint column is printed, not pinned: it is
+# the current detection heuristic's behaviour, and a run that fixes #54 should move the print, not
+# turn the suite red.
+from laya.router import Router as _RoutingRouter  # noqa: E402
+
+_DE_NO_DIACRITICS = [
+    "Zahlung fehlgeschlagen", "Wo finde ich meine Rechnung", "Ich kann mich nicht anmelden",
+    "Die App startet nicht", "Wie aendere ich meine Adresse", "Bestellung noch nicht angekommen",
+    "Ich brauche eine Kuendigung", "Was kostet die MwSt?",
+]
+_DE_DIACRITIC = [
+    "Rechnung für die MwSt stimmt nicht", "Paßwort zurücksetzen geht nicht",
+    "Größe des Pakets passt nicht", "Kündigung per E-Mail senden",
+    "Gehälter ohne Umlaute im Profil", "Wie viel kostet der Versand heute",
+    "Ich möchte meine Adresse ändern", "Wo muß ich das Formular einreichen",
+]
+_DE_ALL = _DE_NO_DIACRITICS + _DE_DIACRITIC
+_Q_GUESS = {"a": {"type": "noul", "instructions": "Is `text` a support question?"}}
+_rt = _RoutingRouter()
+
+
+def _on_english(texts, **kw):
+    return [t for t in texts if _rt.route({"text": t}, _Q_GUESS, **kw)["model"] == "english"]
+
+
+print("\n  lang_guess table, this run (queries read as English):")
+for _label, _qs in (("without umlauts or ß", _DE_NO_DIACRITICS), ("with umlauts or ß", _DE_DIACRITIC)):
+    print("    %-24s no hint %d, lang_guess=\"de\" %d   %s"
+          % (_label, len(_on_english(_qs)), len(_on_english(_qs, lang_guess="de")), _on_english(_qs)))
+check("routing/with the de hint no German query is read as English",
+      _on_english(_DE_ALL, lang_guess="de"), [])
+
+
+# --------------------------------------------------------------- Non-Object Remote Response
+#
+# A remote laya-serve body is arbitrary JSON: a gateway, a mis-pointed `base_url`, or a proxy error
+# page can answer with a top-level array, string, number or `true`/`null`. `json.loads` accepts each
+# of those and the consumers read the result with `result.get("answers", …)`, so before the guard a
+# non-object leaked `AttributeError: 'list' object has no attribute 'get'` past the fail-closed path
+# instead of the `RuntimeError` every other remote failure raises here. `_call_remote` is driven
+# directly so the check is independent of whether langchain-core is installed in this run.
+class _RawBodyResponse:
+    def __init__(self, raw):
+        self._data = raw.encode("utf-8")
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+class _RawBodyOpener:
+    def __init__(self, raw):
+        self._raw = raw
+
+    def open(self, req, timeout=10.0):
+        return _RawBodyResponse(self._raw)
+
+
+_NON_OBJECT_BODIES_LC = [
+    "[]",
+    '[{"answers": {"q": {"choice": "a"}}}]',
+    '"unauthorized"',
+    "null",
+    "123",
+    "true",
+]
+_orig_build_opener_lc = langchain_module.urllib.request.build_opener
+try:
+    for _raw in _NON_OBJECT_BODIES_LC:
+        langchain_module.urllib.request.build_opener = (lambda *a, _r=_raw: _RawBodyOpener(_r))
+        try:
+            langchain_module._call_remote("http://localhost:8000", "s", {"q": {}})
+            check_true("nonobj/%s/raises" % _raw, False, "no error raised")
+        except RuntimeError as _e:
+            check_true("nonobj/%s/malformed" % _raw,
+                       "Malformed decision response" in str(_e))
+            check_true("nonobj/%s/names object" % _raw,
+                       "expected a JSON object" in str(_e))
+        except Exception as _e:
+            check_true("nonobj/%s/raises" % _raw, False, type(_e).__name__)
+    # Positive control: a well-formed object body passes straight through -- the guard does not
+    # over-reject.
+    _obj_body = json.dumps({"answers": {"q": {"choice": "a"}}})
+    langchain_module.urllib.request.build_opener = lambda *a: _RawBodyOpener(_obj_body)
+    check("nonobj/object passes through",
+          langchain_module._call_remote("http://localhost:8000", "s", {"q": {}}),
+          {"answers": {"q": {"choice": "a"}}})
+finally:
+    langchain_module.urllib.request.build_opener = _orig_build_opener_lc
+
+
+# --------------------------------------------------------------- Non-Object `answers` Field
+#
+# The section above makes `_call_remote` refuse a top-level array, string, number or `true`/`null`.
+# One level deeper is the same arbitrary JSON: a gateway can answer `{"answers": []}`. Reading
+# `result.get("answers", {})` hands back the list -- the key is present, so the `{}` default never
+# fires -- and the four consumers then either crash (`LayaRouter` subscripts it, the guardrail calls
+# `.items()` on it, the triage `.get("intent", …)`) or hand a non-mapping straight back to user code.
+# None of those is a documented outcome. `answers` absent and `answers` an empty object are the
+# no-decision cases that already have their own behaviour, and that behaviour is pinned unchanged here.
+_LC_BAD_ANSWERS = [
+    (["boom"], "list"),
+    ("boom", "str"),
+    (3, "int"),
+    (True, "bool"),
+    (None, "null"),
+]
+_LC_CRITERIA = {"billing": "invoices, refunds", "technical": "bugs, errors"}
+_lc_orig_opener_badans = langchain_module.urllib.request.build_opener
+try:
+    for _answers, _label in _LC_BAD_ANSWERS:
+        _raw_bad = json.dumps({"answers": _answers})
+        langchain_module.urllib.request.build_opener = (
+            lambda *a, _r=_raw_bad: _RawBodyOpener(_r))
+        try:
+            langchain_module._call_remote("http://localhost:8000", "s", {"q": {}})
+            check_true("badans/%s/_call_remote raises" % _label, False, "no error raised")
+        except RuntimeError as _e:
+            check_true("badans/%s/names answers" % _label,
+                       "'answers' must be a JSON object" in str(_e), str(_e))
+        except Exception as _e:
+            check_true("badans/%s/_call_remote raises" % _label, False, type(_e).__name__)
+
+        for _entry, _run in (
+            ("router", lambda: LayaRouter(criteria=_LC_CRITERIA, base_url="http://localhost:8000",
+                                          api_key="k").invoke("I need an invoice refund")),
+            ("guardrail", lambda: LayaGuardrail(base_url="http://localhost:8000",
+                                                api_key="k").invoke(
+                                                    "What is the capital of France?")),
+            ("triage", lambda: LayaTriage(base_url="http://localhost:8000",
+                                          api_key="k").invoke({"state": "I want a refund"})),
+        ):
+            try:
+                _run()
+                check_true("badans/%s/%s raises" % (_label, _entry), False, "no error raised")
+            except RuntimeError:
+                check_true("badans/%s/%s raises" % (_label, _entry), True)
+            except Exception as _e:
+                check_true("badans/%s/%s raises" % (_label, _entry), False, type(_e).__name__)
+
+    # The refusal names the offending type -- with `answers` nested inside an otherwise valid body,
+    # that is the only thing a caller reading a log line can act on.
+    langchain_module.urllib.request.build_opener = (
+        lambda *a: _RawBodyOpener(json.dumps({"answers": ["boom"]})))
+    try:
+        langchain_module._call_remote("http://localhost:8000", "s", {"q": {}})
+        check_true("badans/names the type", False, "no error raised")
+    except RuntimeError as _e:
+        check_true("badans/names the type", "got list" in str(_e), str(_e))
+
+    # Controls: a real decision still routes, screens and triages...
+    langchain_module.urllib.request.build_opener = (lambda *a: _RawBodyOpener(json.dumps({
+        "answers": {
+            "route": {"type": "choice", "choice": "billing",
+                      "confidence": 0.9, "answer_confidence": 0.9},
+        }})))
+    check("badans/object still routes",
+          LayaRouter(criteria=_LC_CRITERIA, base_url="http://localhost:8000").invoke(
+              "I need an invoice refund"), "billing")
+    check("badans/object still screens safe",
+          LayaGuardrail(base_url="http://localhost:8000").invoke(
+              "What is the capital of France?"), "What is the capital of France?")
+    check_true("badans/object still triages",
+               isinstance(LayaTriage(base_url="http://localhost:8000").invoke(
+                   {"state": "I want a refund"}), dict))
+
+    # ...and an empty-but-object `answers` keeps the two no-decision behaviours it already had: the
+    # router's own KeyError naming the question it asked, the guardrail reporting no violations.
+    langchain_module.urllib.request.build_opener = (
+        lambda *a: _RawBodyOpener(json.dumps({"answers": {}})))
+    check("badans/empty answers still screens safe",
+          LayaGuardrail(base_url="http://localhost:8000").invoke(
+              "What is the capital of France?"), "What is the capital of France?")
+    try:
+        LayaRouter(criteria=_LC_CRITERIA, base_url="http://localhost:8000").invoke(
+            "I need an invoice refund")
+        check_true("badans/empty answers keeps its KeyError", False, "no error raised")
+    except KeyError as _e:
+        check_true("badans/empty answers keeps its KeyError", str(_e) == "'route'", str(_e))
+
+    # A body with no `answers` key at all is the other no-decision shape: the guard fires on a present
+    # field only, so the guardrail still reports no violations rather than refusing the response.
+    langchain_module.urllib.request.build_opener = (
+        lambda *a: _RawBodyOpener(json.dumps({"model": "laya-multilingual"})))
+    check("badans/answers absent still screens safe",
+          LayaGuardrail(base_url="http://localhost:8000").invoke(
+              "What is the capital of France?"), "What is the capital of France?")
+    check_true("badans/answers absent still triages",
+               isinstance(LayaTriage(base_url="http://localhost:8000").invoke(
+                   {"state": "I want a refund"}), dict))
+finally:
+    langchain_module.urllib.request.build_opener = _lc_orig_opener_badans
+
+
+# ---------------------------------------------- Nested answer objects and `noul` values
+#
+# The section above stops at `answers` itself. Two consumers -- `LayaGuardrail._finish` and
+# `LayaTriage._finish` -- then trusted everything under it, while `LayaTaskGuard.screen` and
+# `LayaAgentRouter.screen` had already moved to `_guard.answers_map`/`_guard.answer_number` (#1335).
+# Three levels leaked here: an answer that is not an object, a `noul` that is not a number, and a
+# `noul` key the answer does not carry.
+_LC_NESTED_ANSWER = [
+    ({"answers": {"jailbreak": "nope"}}, "answer-str", "guardrail"),
+    ({"answers": {"jailbreak": ["nope"]}}, "answer-list", "guardrail"),
+    ({"answers": {"jailbreak": None}}, "answer-null", "guardrail"),
+    ({"answers": {"jailbreak": {"type": "noul", "noul": "high"}}}, "noul-str", "guardrail"),
+    ({"answers": {"jailbreak": {"type": "noul", "noul": None}}}, "noul-null", "guardrail"),
+    ({"answers": {"jailbreak": {"type": "noul", "noul": True}}}, "noul-bool", "guardrail"),
+    ({"answers": {"jailbreak": {"type": "noul", "noul": float("nan")}}}, "noul-nan", "guardrail"),
+    ({"answers": {"intent": "escalate"}}, "answer-str", "triage"),
+    ({"answers": {"intent": ["escalate"]}}, "answer-list", "triage"),
+    ({"answers": {"intent": None}}, "answer-null", "triage"),
+    ({"answers": {"is_urgent": {"noul": "0.9"}}}, "noul-str", "triage"),
+    ({"answers": {"is_urgent": {"noul": None}}}, "noul-null", "triage"),
+    ({"answers": {"is_urgent": {"noul": True}}}, "noul-bool", "triage"),
+    ({"answers": {"churn_risk": {"noul": float("nan")}}}, "noul-nan", "triage"),
+]
+_lc_orig_opener_nested = langchain_module.urllib.request.build_opener
+try:
+    for _body, _label, _entry in _LC_NESTED_ANSWER:
+        _name = "%s/%s" % (_entry, _label)
+        langchain_module.urllib.request.build_opener = (
+            lambda *a, _r=json.dumps(_body): _RawBodyOpener(_r))
+        _run = (lambda: LayaGuardrail(base_url="http://localhost:8000",
+                                      api_key="k").invoke("What is the capital of France?")) \
+            if _entry == "guardrail" else \
+            (lambda: LayaTriage(base_url="http://localhost:8000",
+                                api_key="k").invoke({"state": "I want a refund"}))
+        try:
+            _run()
+            check_true("nested/%s raises" % _name, False, "no error raised")
+        except RuntimeError as _e:
+            check_true("nested/%s raises" % _name, True)
+            check_true("nested/%s malformed" % _name,
+                       "Malformed decision response" in str(_e), str(_e))
+            check_true("nested/%s names the field" % _name,
+                       ("'jailbreak'" in str(_e) or "noul" in str(_e) or "'intent'" in str(_e)
+                        or "is_urgent" in str(_e) or "churn_risk" in str(_e)), str(_e))
+        except Exception as _e:
+            check_true("nested/%s raises" % _name, False, type(_e).__name__)
+
+    # A `{"type": "noul"}` with no `noul` at all used to raise KeyError: 'noul' as soon as the
+    # threshold let the comparison through, because the value was re-read from the answer after the
+    # `>=` guard. It now reads as the 0.0 the comparison already used, exactly as `LayaTaskGuard`
+    # reports it, so the guardrail answers instead of crashing.
+    langchain_module.urllib.request.build_opener = (
+        lambda *a: _RawBodyOpener(json.dumps({"answers": {"jailbreak": {"type": "noul"}}})))
+    _annotated = LayaGuardrail(base_url="http://localhost:8000", api_key="k",
+                               action="annotate", threshold=0.0).invoke(
+                                   {"state": "What is the capital of France?"})
+    check("nested/guardrail/noul-absent records the default",
+          _annotated["guardrails"]["violations"], {"jailbreak": {"probability": 0.0,
+                                                                "confidence": 0.0}})
+
+    # Controls: a well-formed body projects the same numbers it always did, on both surfaces.
+    langchain_module.urllib.request.build_opener = (
+        lambda *a: _RawBodyOpener(json.dumps({"answers": {
+            "jailbreak": {"type": "noul", "noul": 0.9, "confidence": 0.4},
+            "toxicity": {"type": "score", "score": 3, "probabilities": {"0": 0.0, "1": 0.2,
+                                                                       "2": 0.3, "3": 0.5}}}})))
+    _violated = LayaGuardrail(base_url="http://localhost:8000", api_key="k",
+                              action="annotate").invoke({"state": "hello"})
+    check("nested/guardrail/well-formed still records noul",
+          _violated["guardrails"]["violations"]["jailbreak"],
+          {"probability": 0.9, "confidence": 0.4})
+    check("nested/guardrail/well-formed still records score",
+          _violated["guardrails"]["violations"]["toxicity"]["probability"], 0.8)
+    langchain_module.urllib.request.build_opener = (
+        lambda *a: _RawBodyOpener(json.dumps({"answers": {
+            "intent": {"type": "choice", "choice": "refund", "confidence": 0.8},
+            "is_urgent": {"type": "noul", "noul": 0.7},
+            "churn_risk": {"type": "noul", "noul": 0.1},
+            "refund_requested": {"type": "noul", "noul": 0.9},
+            "frustration": {"type": "score", "score": 2}}})))
+    check("nested/triage/well-formed still projects",
+          LayaTriage(base_url="http://localhost:8000", api_key="k").invoke(
+              {"state": "I want a refund"})["triage"],
+          {"intent": "refund", "intent_confidence": 0.8, "is_urgent": True,
+           "frustration_score": 2, "churn_risk": False, "refund_requested": True})
+
+    # A missing question in the body is still the no-decision case it was: `{}` answers read as 0.0,
+    # so nothing is refused and nothing is flagged.
+    langchain_module.urllib.request.build_opener = (
+        lambda *a: _RawBodyOpener(json.dumps({"answers": {"intent": {"type": "choice"}}})))
+    check("nested/triage/absent noul questions stay false",
+          LayaTriage(base_url="http://localhost:8000", api_key="k").invoke(
+              {"state": "hi"})["triage"]["is_urgent"], False)
+finally:
+    langchain_module.urllib.request.build_opener = _lc_orig_opener_nested
 
 
 # --------------------------------------------------------------- Summary

@@ -3,10 +3,13 @@
 A fake Router is injected so nothing loads a checkpoint; we only assert that the
 HTTP layer maps requests/responses and enforces auth as hs-jev expects.
 """
+import ast
+import asyncio
 import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -19,17 +22,30 @@ from fastapi.testclient import TestClient  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from laya.serve import (  # noqa: E402
+    BATCH_BODY_CALL_CONTROLS,
+    BATCH_BODY_OUT_PARAMETERS,
+    BATCH_BODY_ITEM_CONTROLS,
     BODY_CONTROLS,
     BODY_REFUSALS,
+    DEFAULT_BODY_READ_TIMEOUT,
+    DEFAULT_LOG_LEVEL,
     DEFAULT_MAX_TOKEN_BUDGET,
+    DEFAULT_PORT,
     MAX_BODY_BYTES,
     MAX_STATE_CHARS,
+    _add_jev_confidence,
     _apply_thread_limit,
     _check_request_limits,
     _env_bool,
+    _LONE_SURROGATE_DETAIL,
+    _resolve_body_read_timeout,
+    _resolve_log_level,
     _resolve_max_token_budget,
+    _resolve_idle_unload_seconds,
     _resolve_max_loaded,
     _resolve_model,
+    _resolve_port,
+    _resolve_tournament_group,
     create_app,
 )
 
@@ -96,6 +112,23 @@ def test_root_path_from_environment_updates_openapi_and_keeps_routes(monkeypatch
         assert client.get("/openapi.json").json()["servers"] == [{"url": "/laya"}]
 
 
+@pytest.mark.parametrize("path", ["/openapi.json", "/docs", "/redoc"])
+def test_no_docs_or_schema_on_a_locked_down_deployment(monkeypatch, path):
+    """FastAPI's own documentation routes are not written by this module, so per-route auth never
+    covered them: with LAYA_API_KEY set they answered 200 to an unauthenticated caller, publishing
+    the API shape and an interactive console beside a service the operator had locked down."""
+    client, _ = _client(monkeypatch, api_key="s3cret")
+    assert client.get(path).status_code == 404
+    # The decision routes still refuse without the bearer, so the app itself is up.
+    assert client.post("/v1/systemone", json=REQ).status_code == 401
+
+
+def test_docs_and_schema_are_served_without_a_key(monkeypatch):
+    client, _ = _client(monkeypatch)
+    assert client.get("/openapi.json").status_code == 200
+    assert client.get("/docs").status_code == 200
+
+
 @pytest.mark.parametrize("root_path", [None, ""])
 def test_root_path_defaults_to_empty(monkeypatch, root_path):
     if root_path is None:
@@ -128,6 +161,422 @@ def test_predict_passthrough_shape(monkeypatch):
     assert body["answers"]["dept"]["choice"] == "billing"
     # unknown model id was dropped -> router asked to auto-route
     assert fake.calls[0]["model"] is None
+
+
+# A router that answers with the full Laya payload: every answer type, the per-answer
+# additions and the extended usage report -- what a strict client must be projected off.
+FULL_ANSWERS = {
+    "queue": {"type": "choice", "choice": "billing",
+              "probabilities": {"billing": 0.9519, "tech": 0.0327, "other": 0.0154},
+              "confidence": 0.797, "answer_confidence": 0.9519,
+              "action": {"act_probability": 1.0}},
+    "urgency": {"type": "score", "score": 1.6994,
+                "legend": {"0": "calm", "1": "firm", "2": "angry"},
+                "probabilities": {"0": 0.0249, "1": 0.65, "2": 0.3251},
+                "confidence": 0.1925, "answer_confidence": 0.65,
+                "action": {"act_probability": 0.5}},
+    "threat": {"type": "noul", "noul": 0.9148, "confidence": 0.9148,
+               "answer_confidence": 0.9148, "action": {"act_probability": 1.0}},
+}
+FULL_USAGE = {"input_tokens": 83, "output_tokens": 0, "state_tokens": 12,
+              "state_tokens_dropped": 0, "truncated": False, "truncated_questions": []}
+
+
+class StrictFullRouter:
+    """Returns the full payload, additions and all, whatever the request."""
+
+    loaded = ["english"]
+
+    def __init__(self):
+        self.calls = []
+
+    def predict(self, state, questions, model=None):
+        self.calls.append({"state": state, "questions": questions, "model": model})
+        return {"model": "laya-rl-agent", "answers": FULL_ANSWERS, "usage": dict(FULL_USAGE),
+                "routing": {"model": "english", "reason": "English Latin text"}}
+
+    def predict_batch(self, requests, **kwargs):
+        return [self.predict(item["state"], item["questions"], model=item.get("model"))
+                for item in requests]
+
+
+def _strict_client(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("LAYA_JEV_STRICT", raising=False)
+    else:
+        monkeypatch.setenv("LAYA_JEV_STRICT", value)
+    fake = StrictFullRouter()
+    return TestClient(create_app(router=fake)), fake
+
+
+def test_jev_strict_projects_the_full_payload(monkeypatch):
+    client, _ = _strict_client(monkeypatch, "1")
+    r = client.post("/v1/systemone", json=REQ)
+    assert r.status_code == 200
+    body = r.json()
+    # the strict contract: exactly three top-level fields, the contracted answer keys
+    assert set(body) == {"model", "answers", "usage"}
+    assert body["model"] == "laya-rl-agent"
+    assert body["answers"]["queue"] == {"type": "choice", "choice": "billing",
+                                        "confidence": 0.797,
+                                        "probabilities": {"billing": 0.9519, "tech": 0.0327,
+                                                          "other": 0.0154}}
+    assert body["answers"]["urgency"] == {"type": "score", "score": 1.6994,
+                                          "confidence": 0.1925,
+                                          "probabilities": {"0": 0.0249, "1": 0.65, "2": 0.3251},
+                                          "legend": {"0": "calm", "1": "firm", "2": "angry"}}
+    assert body["answers"]["threat"] == {"type": "noul", "noul": 0.9148}
+    # usage reduced to the two contracted counts, with the values the result carried
+    assert body["usage"] == {"input_tokens": 83, "output_tokens": 0}
+
+
+def test_jev_strict_is_off_by_default(monkeypatch):
+    """No flag: the full payload, additions and all, byte for byte."""
+    client, _ = _strict_client(monkeypatch, None)
+    body = client.post("/v1/systemone", json=REQ).json()
+    assert set(body) == {"model", "answers", "usage", "routing"}
+    assert "action" in body["answers"]["queue"]
+    assert "confidence" in body["answers"]["threat"]
+    assert body["usage"] == FULL_USAGE
+
+
+def test_jev_strict_rejects_falsy_spellings(monkeypatch):
+    client, _ = _strict_client(monkeypatch, "0")
+    body = client.post("/v1/systemone", json=REQ).json()
+    assert "routing" in body
+
+
+def test_jev_strict_batch_projects_every_item(monkeypatch):
+    client, fake = _strict_client(monkeypatch, "1")
+    r = client.post("/v1/systemone/batch", json={"states": ["one", "two"],
+                                                 "questions": REQ["questions"]})
+    assert r.status_code == 200
+    data = r.json()
+    assert [set(item) for item in data["results"]] == [
+        {"model", "answers", "usage"}, {"model", "answers", "usage"}]
+    assert all("routing" not in item for item in data["results"])
+    assert all(item["usage"] == {"input_tokens": 83, "output_tokens": 0}
+               for item in data["results"])
+    # total_usage is the batch envelope's own, untouched by the projection
+    assert data["total_usage"] == {"input_tokens": 166, "output_tokens": 0}
+
+
+def test_jev_strict_leaves_an_unknown_answer_shape_unchanged(monkeypatch):
+    """A shape the contract does not name is passed through: the caller still sees it."""
+    monkeypatch.setenv("LAYA_JEV_STRICT", "1")
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+
+    class OddRouter:
+        loaded = ["english"]
+
+        def predict(self, state, questions, model=None):
+            return {"model": "laya-rl-agent",
+                    "answers": {"odd": {"type": "weird", "payload": 1}},
+                    "usage": {"input_tokens": 1, "output_tokens": 0}}
+
+    client = TestClient(create_app(router=OddRouter()))
+    body = client.post("/v1/systemone", json=REQ).json()
+    assert body["answers"]["odd"] == {"type": "weird", "payload": 1}
+    assert "routing" not in body
+
+
+def test_choice_and_score_answers_carry_jev_confidence(monkeypatch):
+    """Each choice and score answer reports Jev's `confidence` beside Laya's own (#302)."""
+    client, _ = _strict_client(monkeypatch, None)
+    answers = client.post("/v1/systemone", json=REQ).json()["answers"]
+    # choice: (max(p) - 1/n) / (1 - 1/n) over billing 0.9519 / tech 0.0327 / other 0.0154
+    assert answers["queue"]["x_jev_confidence"] == 0.9278
+    # score: 1 - sum(p_i * |i - mode|) / D with mode 1 and D = 2/3, so 1 - 0.35 / (2/3)
+    assert answers["urgency"]["x_jev_confidence"] == 0.475
+    # Laya's own numbers are untouched, and a noul answer has no Jev confidence to report
+    assert answers["queue"]["confidence"] == 0.797
+    assert answers["urgency"]["confidence"] == 0.1925
+    assert "x_jev_confidence" not in answers["threat"]
+    # the router's own answer dicts are not edited, so a reused result cannot leak the field
+    assert "x_jev_confidence" not in FULL_ANSWERS["queue"]
+
+
+def test_batch_answers_carry_jev_confidence(monkeypatch):
+    client, _ = _strict_client(monkeypatch, None)
+    data = client.post("/v1/systemone/batch", json={"states": ["one", "two"],
+                                                    "questions": REQ["questions"]}).json()
+    assert [item["answers"]["queue"]["x_jev_confidence"] for item in data["results"]] == [0.9278, 0.9278]
+
+
+def test_jev_strict_leaves_out_jev_confidence(monkeypatch):
+    """Strict mode serves only the contracted keys, so the `x_` addition is not among them."""
+    client, _ = _strict_client(monkeypatch, "1")
+    single = client.post("/v1/systemone", json=REQ).json()
+    batch = client.post("/v1/systemone/batch", json={"states": ["one"],
+                                                     "questions": REQ["questions"]}).json()
+    for answers in (single["answers"], batch["results"][0]["answers"]):
+        assert all("x_jev_confidence" not in answer for answer in answers.values())
+
+
+# --- LAYA_TOURNAMENT_GROUP: large choices answered by elimination (#302) ----------------------
+
+def _queues(n):
+    return {"Queue %03d" % i: "Tickets routed to queue %d" % i for i in range(n)}
+
+
+def _large_req(n, **question):
+    return {"state": "I was charged twice, please refund one.",
+            "questions": {"queue": {"type": "choice", "instructions": "Which queue?",
+                                    "criteria": _queues(n), **question}}}
+
+
+class EliminationRouter:
+    """Answers every choice it is asked: `Queue 077` wins when offered, else the first label.
+
+    Records each call's question set and reports 10 input tokens per question, so a test can count
+    the calls a tournament made and check that their usage was summed.
+    """
+
+    loaded = ["english"]
+
+    def __init__(self):
+        self.calls = []
+
+    def predict(self, state, questions, model=None, **kwargs):
+        self.calls.append(questions)
+        answers = {}
+        for qid, q in questions.items():
+            labels = list(q["criteria"])
+            winner = "Queue 077" if "Queue 077" in labels else labels[0]
+            rest = (0.3 / (len(labels) - 1)) if len(labels) > 1 else 0.0
+            probabilities = {label: (0.7 if label == winner else rest) for label in labels}
+            if len(labels) == 1:
+                probabilities[winner] = 1.0
+            answers[qid] = {"type": "choice", "choice": winner, "probabilities": probabilities,
+                            "confidence": 0.5, "answer_confidence": probabilities[winner]}
+        return {"model": "laya-rl-agent", "answers": answers,
+                "usage": {"input_tokens": 10 * len(questions), "output_tokens": 0},
+                "routing": {"model": "english", "reason": "English Latin text"}}
+
+
+def _tournament_client(monkeypatch, group, strict=False):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    if group is None:
+        monkeypatch.delenv("LAYA_TOURNAMENT_GROUP", raising=False)
+    else:
+        monkeypatch.setenv("LAYA_TOURNAMENT_GROUP", group)
+    if strict:
+        monkeypatch.setenv("LAYA_JEV_STRICT", "1")
+    else:
+        monkeypatch.delenv("LAYA_JEV_STRICT", raising=False)
+    fake = EliminationRouter()
+    return TestClient(create_app(router=fake)), fake
+
+
+def test_large_choice_is_refused_without_a_tournament(monkeypatch):
+    client, fake = _tournament_client(monkeypatch, None)
+    r = client.post("/v1/systemone", json=_large_req(128))
+    assert r.status_code == 413
+    assert "128 > 100" in r.json()["detail"]
+    assert fake.calls == []
+
+
+def test_tournament_refuses_unhashable_choice_labels_as_a_422(monkeypatch):
+    # A large choice is narrowed by elimination, and `_tournament_plan` reads the criteria labels
+    # (deduping them through a set) BEFORE `router.predict`, so core's `_check_question` -- which
+    # refuses a non-scalar label with a ValueError naming the question, as the no-tournament group=None
+    # case below already shows -- has not run yet. A `criteria` written as a list of JSON arrays used to
+    # leak the set-dedup `TypeError` through the endpoint's catch-all and answer 500 "inference failed".
+    client, fake = _tournament_client(monkeypatch, "2")
+    req = {"state": "I was charged twice, please refund one.",
+           "questions": {"queue": {"type": "choice", "instructions": "Which queue?",
+                                   "criteria": [["a", 1], ["b", 2], ["c", 3]]}}}
+    r = client.post("/v1/systemone", json=req)
+    assert r.status_code == 422, r.text
+    assert "queue" in r.json()["detail"]
+    assert fake.calls == []  # refused while planning, before any prediction
+
+
+def test_tournament_plan_names_the_question_on_unhashable_labels():
+    from laya import serve
+    with pytest.raises(ValueError, match="queue"):
+        serve._tournament_plan({"queue": {"type": "choice",
+                                          "criteria": [["a", 1], ["b", 2], ["c", 3]]}}, 2)
+    # Positive control: string-labelled criteria still plan (the guard is not over-strict).
+    assert serve._tournament_plan(
+        {"queue": {"type": "choice", "criteria": ["a", "b", "c"]}}, 2) == {"queue": ["a", "b", "c"]}
+
+
+def test_tournament_answers_a_large_choice_in_the_jev_shape(monkeypatch):
+    client, fake = _tournament_client(monkeypatch, "16")
+    r = client.post("/v1/systemone", json=_large_req(128))
+    assert r.status_code == 200
+    body = r.json()
+    answer = body["answers"]["queue"]
+    # every option is named, in criteria order, and the values are still a distribution
+    assert list(answer["probabilities"]) == list(_queues(128))
+    assert abs(sum(answer["probabilities"].values()) - 1.0) < 1e-9
+    # the choice is still the argmax; eliminated options carry 0.0, finalists the final round's values
+    assert answer["choice"] == "Queue 077"
+    assert max(answer["probabilities"], key=answer["probabilities"].get) == "Queue 077"
+    assert answer["x_tournament"]["rounds"] == 1
+    finalists = answer["x_tournament"]["finalists"]
+    assert len(finalists) == 8 and "Queue 077" in finalists
+    assert all(p == 0.0 for label, p in answer["probabilities"].items() if label not in finalists)
+    assert "tournament" not in body
+    # one round of 8 group questions, then the final call; usage is summed over both
+    assert [len(call) for call in fake.calls] == [8, 1]
+    assert body["usage"]["input_tokens"] == 90
+
+
+@pytest.mark.parametrize("group, n", [("100", 101), ("100", 150), ("100", 255), ("16", 101), ("2", 255)])
+def test_every_choice_over_the_one_pass_cap_is_narrowed(monkeypatch, group, n):
+    """A choice only the raised cap admits never reaches the one-pass path, at any valid group."""
+    client, fake = _tournament_client(monkeypatch, group)
+    r = client.post("/v1/systemone", json=_large_req(n))
+    assert r.status_code == 200
+    sizes = [len(q["criteria"]) for q in fake.calls[0].values()]
+    assert len(sizes) == -(-n // int(group)) and sum(sizes) == n and max(sizes) <= int(group)
+    assert len(r.json()["answers"]["queue"]["probabilities"]) == n
+
+
+def test_a_group_over_the_one_pass_cap_leaves_the_flag_off(monkeypatch):
+    """`LAYA_TOURNAMENT_GROUP=200` with 150 options: off, so the clear cap refusal, not a budget one."""
+    client, fake = _tournament_client(monkeypatch, "200")
+    r = client.post("/v1/systemone", json=_large_req(150))
+    assert r.status_code == 413
+    assert "150 > 100" in r.json()["detail"]
+    assert fake.calls == []
+
+
+def test_tournament_accepts_up_to_255_options(monkeypatch):
+    client, _ = _tournament_client(monkeypatch, "16")
+    assert client.post("/v1/systemone", json=_large_req(255)).status_code == 200
+    r = client.post("/v1/systemone", json=_large_req(256))
+    assert r.status_code == 413
+    assert "256 > 255" in r.json()["detail"]
+
+
+def test_tournament_under_strict_keeps_only_the_contracted_keys(monkeypatch):
+    client, _ = _tournament_client(monkeypatch, "16", strict=True)
+    answer = client.post("/v1/systemone", json=_large_req(128)).json()["answers"]["queue"]
+    assert set(answer) == {"type", "choice", "confidence", "probabilities"}
+    assert len(answer["probabilities"]) == 128
+
+
+def test_small_choice_skips_the_tournament(monkeypatch):
+    client, fake = _tournament_client(monkeypatch, "16")
+    req = _large_req(16)
+    answer = client.post("/v1/systemone", json=req).json()["answers"]["queue"]
+    assert fake.calls == [req["questions"]]
+    assert "x_tournament" not in answer
+
+
+def test_option_order_keeps_the_one_pass_path(monkeypatch):
+    """Narrowing cannot carry an order over the full label set (#1062), so it is not attempted."""
+    client, fake = _tournament_client(monkeypatch, "16")
+    req = _large_req(32, option_order=list(range(32))[::-1])
+    answer = client.post("/v1/systemone", json=req).json()["answers"]["queue"]
+    assert len(fake.calls) == 1 and len(fake.calls[0]["queue"]["criteria"]) == 32
+    assert "x_tournament" not in answer
+
+
+def _large_batch(n, states=("I was charged twice.", "Please refund one of the charges."), **question):
+    req = _large_req(n, **question)
+    return {"states": list(states), "questions": req["questions"]}
+
+
+def test_batch_answers_a_large_choice_per_state(monkeypatch):
+    client, fake = _tournament_client(monkeypatch, "16")
+    r = client.post("/v1/systemone/batch", json=_large_batch(128))
+    assert r.status_code == 200
+    data = r.json()
+    for item in data["results"]:
+        answer = item["answers"]["queue"]
+        assert list(answer["probabilities"]) == list(_queues(128))
+        assert answer["choice"] == "Queue 077" and answer["x_tournament"]["rounds"] == 1
+        assert item["usage"]["input_tokens"] == 90
+    # each state ran its own round and final call, and the envelope sums every call
+    assert [len(call) for call in fake.calls] == [8, 1, 8, 1]
+    assert data["total_usage"] == {"input_tokens": 180, "output_tokens": 0}
+
+
+def test_batch_cap_follows_the_tournament_group(monkeypatch):
+    client, _ = _tournament_client(monkeypatch, None)
+    r = client.post("/v1/systemone/batch", json=_large_batch(128))
+    assert r.status_code == 413 and "128 > 100" in r.json()["detail"]
+    client, _ = _tournament_client(monkeypatch, "16")
+    r = client.post("/v1/systemone/batch", json=_large_batch(256))
+    assert r.status_code == 413 and "256 > 255" in r.json()["detail"]
+
+
+def test_batch_under_strict_keeps_only_the_contracted_keys(monkeypatch):
+    client, _ = _tournament_client(monkeypatch, "16", strict=True)
+    data = client.post("/v1/systemone/batch", json=_large_batch(128)).json()
+    for item in data["results"]:
+        answer = item["answers"]["queue"]
+        assert set(answer) == {"type", "choice", "confidence", "probabilities"}
+        assert len(answer["probabilities"]) == 128
+
+
+def test_batch_without_a_large_choice_keeps_the_batched_pass(monkeypatch):
+    """A batch with nothing to narrow is the one `predict_batch` call it has always been."""
+
+    class BatchingRouter(EliminationRouter):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        def predict_batch(self, requests, **kwargs):
+            self.batches.append(len(requests))
+            return [self.predict(item["state"], item["questions"]) for item in requests]
+
+    monkeypatch.setenv("LAYA_TOURNAMENT_GROUP", "16")
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    monkeypatch.delenv("LAYA_JEV_STRICT", raising=False)
+    fake = BatchingRouter()
+    client = TestClient(create_app(router=fake))
+    data = client.post("/v1/systemone/batch", json=_large_batch(12)).json()
+    assert fake.batches == [2]
+    assert all("x_tournament" not in item["answers"]["queue"] for item in data["results"])
+
+
+def test_an_order_on_a_choice_over_the_one_pass_cap_is_dropped_and_reported(monkeypatch):
+    """Over 100 options one pass was never an option, so the choice is narrowed and says so."""
+    client, fake = _tournament_client(monkeypatch, "16")
+    with pytest.warns(RuntimeWarning, match="option_order"):
+        r = client.post("/v1/systemone", json=_large_req(150, option_order=list(range(150))[::-1]))
+    assert r.status_code == 200
+    report = r.json()["answers"]["queue"]["x_tournament"]
+    assert report["option_order_dropped"] is True and report["rounds"] == 1
+    assert len(fake.calls[0]) == 10
+
+
+def test_a_large_choice_narrows_an_ordered_choice_beside_it(monkeypatch):
+    client, fake = _tournament_client(monkeypatch, "16")
+    req = _large_req(150)
+    req["questions"]["team"] = {"type": "choice", "instructions": "Which team?",
+                                "criteria": {"Team %02d" % i: None for i in range(32)},
+                                "option_order": list(range(32))[::-1]}
+    with pytest.warns(RuntimeWarning, match="'team': 'option_order'"):
+        answers = client.post("/v1/systemone", json=req).json()["answers"]
+    assert answers["team"]["x_tournament"]["option_order_dropped"] is True
+    assert "option_order_dropped" not in answers["queue"]["x_tournament"]
+
+
+def test_non_string_labels_over_the_one_pass_cap_are_refused(monkeypatch):
+    client, fake = _tournament_client(monkeypatch, "16")
+    req = {"state": "refund", "questions": {"code": {"type": "choice", "instructions": "Which code?",
+                                                     "criteria": list(range(150))}}}
+    r = client.post("/v1/systemone", json=req)
+    assert r.status_code == 422 and "string" in r.json()["detail"]
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("raw, want", [(None, 0), ("", 0), ("abc", 0), ("0", 0), ("1", 0), ("-4", 0),
+                                       ("2", 2), ("16", 16), ("100", 100),
+                                       ("101", 0), ("200", 0), ("255", 0)])
+def test_tournament_group_resolution(monkeypatch, raw, want):
+    if raw is None:
+        monkeypatch.delenv("LAYA_TOURNAMENT_GROUP", raising=False)
+    else:
+        monkeypatch.setenv("LAYA_TOURNAMENT_GROUP", raw)
+    assert _resolve_tournament_group() == want
 
 
 def test_known_model_is_honoured(monkeypatch):
@@ -414,6 +863,84 @@ def test_helpers():
     assert _env_bool("X_FLAG", True) is True
 
 
+def test_env_bool_reads_a_blank_value_as_unset(monkeypatch):
+    """`LAYA_X=` is "not set", the way most other readers of this family already read it.
+
+    A blank value is what a `.env` line, a Compose `KEY=` with nothing after it, or a CI matrix
+    writes when a variable is declared and left for the operator to fill in. Reading it as false
+    silently moved `LAYA_PRELOAD` off its documented default of `1` onto lazy loading -- the one
+    switch in the set whose default is True, and `docs/cli-mcp.md` names `0` as the spelling that
+    asks for it -- and `laya_status` then reported the blank back as the operator's own choice.
+    The truthy spelling set is unchanged: anything that is a value and is not one of the four is
+    still false.
+    """
+    for blank in ("", " ", "  \t ", "\n"):
+        monkeypatch.setenv("X_FLAG", blank)
+        assert _env_bool("X_FLAG", True) is True, repr(blank)
+        assert _env_bool("X_FLAG", False) is False, repr(blank)
+
+    monkeypatch.delenv("X_FLAG", raising=False)
+    assert _env_bool("X_FLAG", True) is True
+    assert _env_bool("X_FLAG", False) is False
+
+    for on in ("1", "true", "TRUE", " yes ", "on"):
+        monkeypatch.setenv("X_FLAG", on)
+        assert _env_bool("X_FLAG", False) is True, repr(on)
+    for off in ("0", "no", "off", "false", "ture", "2"):
+        monkeypatch.setenv("X_FLAG", off)
+        assert _env_bool("X_FLAG", True) is False, repr(off)
+
+    # The live case: the preload switch keeps its documented default when the value is blank.
+    monkeypatch.setenv("LAYA_PRELOAD", "")
+    assert _env_bool("LAYA_PRELOAD", True) is True
+    monkeypatch.setenv("LAYA_PRELOAD", "0")
+    assert _env_bool("LAYA_PRELOAD", True) is False
+
+
+def test_resolve_port_reads_a_blank_value_as_unset(monkeypatch):
+    """`LAYA_PORT=` is the same "not set" as an absent variable, and only that.
+
+    `_resolve_port` was the last reader in this module that treated a blank as a value. Every other
+    one answers "unset": `_env_bool` above, `_default_model_option`, `_resolve_max_concurrent`,
+    `_resolve_max_loaded`, `_resolve_max_batch_tokens`, `_resolve_max_token_budget`,
+    `_resolve_tournament_group` and `_resolve_idle_unload_seconds` -- and outside the server,
+    `laya.mcp.server._remote_base_url`, whose own documentation says "Blank or unset means the
+    default." On the base commit the startup path answered the same `SystemExit` it gives a bad
+    port, so a declared-but-unfilled `.env` line stopped the server from starting and the message
+    blamed the operator for a value they never wrote. Blank carries no number for a fallback to
+    contradict, so the documented default is the only honest answer -- and `int()` ignores the
+    whitespace around `" 8000 "`, so a value of nothing *but* that whitespace was fatal while its
+    content was not.
+
+    A value that does name a port is still refused loudly, because binding somewhere other than
+    the requested place leaves the server unreachable rather than merely wrong.
+    """
+    assert DEFAULT_PORT == 8000, "the default the README and docs/http-api.md tables print"
+
+    for blank in ("", " ", "  \t ", "\n"):
+        monkeypatch.setenv("LAYA_PORT", blank)
+        assert _resolve_port() == DEFAULT_PORT, repr(blank)
+
+    monkeypatch.delenv("LAYA_PORT", raising=False)
+    assert _resolve_port() == DEFAULT_PORT
+
+    # The leniency the blank case was dying on, unchanged: whitespace around a number is noise.
+    for text, expected in (("8000", 8000), (" 9000 ", 9000), ("+8080", 8080),
+                           ("1", 1), ("65535", 65535)):
+        monkeypatch.setenv("LAYA_PORT", text)
+        assert _resolve_port() == expected, repr(text)
+
+    # Every non-blank misvalue still exits, naming the value as written rather than as stripped.
+    for bad in ("0", "-1", "70000", "http", "8000.0", "8000px"):
+        monkeypatch.setenv("LAYA_PORT", bad)
+        try:
+            port = _resolve_port()
+        except SystemExit as exc:
+            assert str(exc) == "invalid LAYA_PORT %r: must be an integer 1-65535" % bad, str(exc)
+        else:
+            raise AssertionError("%r was accepted as port %r" % (bad, port))
+
+
 def test_resolve_model_follows_the_router_registry(monkeypatch):
     """A checkpoint added to laya.router must become pinnable over HTTP with no edit here.
 
@@ -452,6 +979,65 @@ def test_resolve_model_follows_the_router_registry(monkeypatch):
     assert _resolve_model("jev-1") is None
 
 
+def test_path_or_unpublished_hub_id_is_refused_on_both_endpoints(monkeypatch):
+    """A path or Hub id this server cannot load must not be answered by another checkpoint.
+
+    ``jev-1`` and ``convaiinnovations/laya`` stay "let the router choose", and so does a
+    plain unknown name: only a path or an unpublished repo id is a wrong answer (#919).
+    Both ``/v1/systemone`` and ``/v1/systemone/batch`` resolve ``model`` through the same
+    helper, so a miss has to be a 422 on each, before any inference.
+    """
+    from fastapi import HTTPException
+
+    passthrough = ("jev-1", "JEV-1", "convaiinnovations/laya", "Convaiinnovations/Laya",
+                   "  convaiinnovations/laya  ", "not-a-checkpoint", None, "")
+    for kept in passthrough:
+        assert _resolve_model(kept) is None, kept
+
+    refused = (
+        "/path/to/checkpoint",
+        "  /path/to/checkpoint  ",
+        "org/repo",
+        "someone/my-checkpoint",
+        "~/models/ckpt",
+        "./checkpoint",
+        ".\\checkpoint",
+        "C:\\models\\ckpt",
+    )
+    for raw in refused:
+        with pytest.raises(HTTPException) as caught:
+            _resolve_model(raw)
+        err = caught.value
+        assert err.status_code == 422, raw
+        assert "unknown model" in err.detail, err.detail
+        assert "choose one of" in err.detail, err.detail
+        assert "omit model to let the router choose" in err.detail, err.detail
+        assert repr(raw) in err.detail, err.detail
+
+    client, fake = _client(monkeypatch)
+    questions = REQ["questions"]
+    for raw in ("/path/to/checkpoint", "org/repo", "~/models/ckpt", ".\\checkpoint"):
+        single = client.post("/v1/systemone", json={**REQ, "model": raw})
+        assert single.status_code == 422, (raw, single.text)
+        assert "unknown model" in single.json()["detail"]
+        assert repr(raw) in single.json()["detail"]
+        batch = client.post("/v1/systemone/batch", json={
+            "states": ["one", "two"], "questions": questions, "model": raw})
+        assert batch.status_code == 422, (raw, batch.text)
+        assert "unknown model" in batch.json()["detail"]
+        assert repr(raw) in batch.json()["detail"]
+    assert fake.calls == [], fake.calls
+
+    for kept in ("jev-1", "convaiinnovations/laya", "not-a-checkpoint"):
+        single = client.post("/v1/systemone", json={**REQ, "model": kept})
+        assert single.status_code == 200, (kept, single.text)
+        assert fake.calls[-1]["model"] is None, (kept, fake.calls[-1])
+        batch = client.post("/v1/systemone/batch", json={
+            "states": ["one"], "questions": questions, "model": kept})
+        assert batch.status_code == 200, (kept, batch.text)
+        assert fake.calls[-1]["model"] is None, (kept, fake.calls[-1])
+
+
 def test_thread_limit(monkeypatch):
     pytest.importorskip("torch")
     monkeypatch.delenv("LAYA_THREADS", raising=False)
@@ -479,22 +1065,29 @@ class _StubAgent:
     def system_one(self, state, questions):
         return {"model": self.name, "answers": {}, "usage": {}}
 
+    def predict_batch(self, states, questions, batch_size=None, **kwargs):
+        return [self.system_one(state, questions) for state in states]
+
 
 def _server_router(monkeypatch, **env):
     """The Router `laya-serve` builds for `env`, with loads recorded instead of performed."""
-    from laya.router import normalise_name
     from laya.serve import build_router
 
     monkeypatch.setenv("LAYA_PRELOAD", "0")       # nothing may download
     monkeypatch.setenv("LAYA_AUTO_TASK", "1")     # the config that puts three checkpoints in play
     monkeypatch.delenv("LAYA_MAX_LOADED", raising=False)
+    monkeypatch.delenv("LAYA_DEFAULT_MODEL", raising=False)
+    monkeypatch.delenv("LAYA_EXTRA_MODELS", raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     router = build_router()
     built = []
 
     def load(name):
-        key = normalise_name(name)
+        # `router.resolve`, not `normalise_name`: `predict` hands `load` the
+        # decision's key, which can be a LAYA_EXTRA_MODELS registration that the
+        # built-in table does not know.
+        key = router.resolve(name)
         if key in router._agents:
             router._touch(key)
             return router._agents[key]
@@ -572,6 +1165,87 @@ def test_raising_the_cap_stops_the_server_rebuilding_a_checkpoint(monkeypatch):
     assert roomy.max_loaded == 3
     assert len(built3) == 3, built3             # each checkpoint once, then they stay resident
     assert sorted(roomy.loaded) == sorted(DEFAULT_MODELS)
+
+
+# README's other answer written as a constructor argument is `Router(default="multilingual")`,
+# given where it explains that very short Latin-script text ("Quero cancelar", "Esqueci minha
+# senha") carries nothing identifying its language and so goes to `default`. Both packaged
+# servers build their Router from the environment and neither could pass it: the only reader of
+# LAYA_DEFAULT_MODEL was examples/server.py, so the demo server honoured the variable while
+# laya-serve routed the ambiguous states to the English checkpoint it was told not to use.
+#
+# Unlike the numeric knobs above, an unresolvable name is fatal here. `LAYA_MAX_LOADED=abc`
+# falling back to 2 costs a rebuild; `LAYA_DEFAULT_MODEL=mutli` falling back to english costs the
+# wrong checkpoint answering every ambiguous state, which is the failure the operator was trying
+# to configure away. So the message is core's and the server refuses to start.
+def test_default_model_reaches_the_router_the_server_builds(monkeypatch):
+    from laya.router import DEFAULT_MODELS, Router, _ALIASES, normalise_name
+    from laya.serve import _default_model_option
+
+    # Unset is "not asked for", not a copy of Router's default -- the same reason
+    # `_resolve_max_loaded` returns None, and the same drift it prevents.
+    monkeypatch.delenv("LAYA_DEFAULT_MODEL", raising=False)
+    assert _default_model_option() == {}
+    for blank in ("", "   ", "\n"):
+        monkeypatch.setenv("LAYA_DEFAULT_MODEL", blank)
+        assert _default_model_option() == {}, repr(blank)
+
+    # The accepted spellings are core's tables read out of core, so a name added to _ALIASES
+    # arrives here on its own -- and a value this module resolves differently from the way
+    # `Router` itself resolves it fails the same line.
+    for name in sorted(set(DEFAULT_MODELS) | set(_ALIASES)):
+        monkeypatch.setenv("LAYA_DEFAULT_MODEL", name)
+        assert _default_model_option() == {"default": normalise_name(name)}, name
+
+    # And it reaches the Router the server builds. The literal is the one the README and
+    # docs/docker.md quote, so moving Router's default has to move those too.
+    router, _ = _server_router(monkeypatch)
+    assert router.default == Router().default
+    assert router.default == "multilingual"
+    for raw, want in (("multilingual", "multilingual"), ("ml", "multilingual"),
+                      (" MULTI ", "multilingual"), ("typed-decisions", "typed-decisions")):
+        router, _ = _server_router(monkeypatch, LAYA_DEFAULT_MODEL=raw)
+        assert router.default == want, raw
+
+    # The decision the whole knob exists to change, measured at `route()` rather than at the
+    # attribute -- `route` documents that it decides "without loading or running anything", so
+    # this costs no weights.
+    ambiguous = ("12345 !!!", "Quero cancelar", "Esqueci minha senha")
+    stock, _ = _server_router(monkeypatch)
+    english, _ = _server_router(monkeypatch, LAYA_DEFAULT_MODEL="english")
+    portuguese, _ = _server_router(monkeypatch, LAYA_DEFAULT_MODEL="multilingual")
+    for state in ambiguous:
+        # the stock default since 0.4.0, and an explicit override in each direction
+        assert stock.route(state).model == "multilingual", state
+        assert "using default (multilingual)" in stock.route(state).reason, state
+        assert english.route(state).model == "english", state
+        assert "using default (english)" in english.route(state).reason, state
+        assert portuguese.route(state).model == "multilingual", state
+        assert "using default (multilingual)" in portuguese.route(state).reason, state
+    # A fallback, not a pin: text the detector can place routes on what it detects.
+    assert portuguese.route({"body": "Please refund the duplicate charge"}).model == "english"
+
+
+def test_an_unresolvable_default_stops_the_server_with_core_s_words(monkeypatch):
+    from laya.serve import build_router
+
+    monkeypatch.setenv("LAYA_PRELOAD", "0")
+    monkeypatch.delenv("LAYA_DEFAULT_MODEL", raising=False)
+    monkeypatch.setenv("LAYA_DEFAULT_MODEL", "mutli-lingual")
+    with pytest.raises(SystemExit) as raised:
+        build_router()
+    message = str(raised.value)
+    # Names the variable, quotes the value the operator typed, and then says in core's own words
+    # what the accepted set is -- so the typo is fixed from the message, not from the source.
+    assert message.startswith("invalid LAYA_DEFAULT_MODEL 'mutli-lingual': unknown model"), message
+    for name in ("english", "multilingual", "typed-decisions", "ml"):
+        assert name in message, message
+    # The contrast with the numeric knobs has to stay the contrast: with the name fixed, the bad
+    # number below still falls back instead of stopping the server.
+    monkeypatch.setenv("LAYA_DEFAULT_MODEL", "english")
+    monkeypatch.setenv("LAYA_MAX_LOADED", "abc")
+    assert build_router().default == "english"
+    assert build_router().max_loaded == 2
 
 
 
@@ -785,6 +1459,19 @@ def test_malformed_question_id_is_a_named_422(monkeypatch, bad_qid):
     assert "question id" in response.text, response.text
 
 
+def test_score_null_level_is_a_named_422(monkeypatch):
+    """A null score level would come back as `legend: {"<i>": null}`, which Jev clients refuse to
+    parse (#302). The request is rejected as a named 422 instead of answered 200."""
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    client = TestClient(create_app(router=ValidatingRouter()), raise_server_exceptions=False)
+    body = dict(REQ)
+    body["questions"] = {"urgency": {"type": "score", "instructions": "How urgent?",
+                                     "criteria": ["low", None, "high"]}}
+    response = client.post("/v1/systemone", json=body)
+    assert response.status_code == 422, response.text
+    assert "null level" in response.text and "urgency" in response.text, response.text
+
+
 def test_a_nested_choice_label_is_a_caller_error_not_a_server_fault(monkeypatch):
     """A `criteria` list containing a list/dict label is the caller's mistake, so it must be 422.
 
@@ -937,10 +1624,47 @@ def test_admission_slot_is_released_after_inference(monkeypatch):
     assert client.post("/v1/systemone", json=REQ).status_code == 200
 
 
+_WAIT_TIMEOUT = 5.0  # seconds; a loopback bind that has not landed by now never will (#721)
+
+
+async def _wait_for_condition(condition, what, timeout=_WAIT_TIMEOUT, interval=0.01):
+    """Poll `condition()` until it is truthy, or fail naming `what` rather than hang (#721).
+
+    An unbounded `while not ...: await asyncio.sleep(interval)` looks identical whether the
+    condition arrives in a millisecond or never, and prints nothing either way, so a host whose
+    loopback networking reports differently from the runners leaves pytest stalled instead of
+    failing. Bounding the wait turns that into an ordinary failure that names the step.
+    """
+
+    async def poll():
+        while not condition():
+            await asyncio.sleep(interval)
+
+    try:
+        await asyncio.wait_for(poll(), timeout)
+    except asyncio.TimeoutError:
+        pytest.fail(f"timed out after {timeout}s waiting for {what}")
+
+
+def test_a_bounded_wait_fails_on_a_condition_that_never_lands():
+    """#721: the bound is the whole point, so it is exercised against a condition that never
+    becomes true. Unbounded, this is the hang the helper exists to remove, and the same code
+    path then cannot be checked by a test that waits for it."""
+    async def lands():
+        await _wait_for_condition(lambda: True, "an already-true condition")
+
+    asyncio.run(lands())  # the satisfied case returns rather than waiting out the timeout
+
+    async def never():
+        await _wait_for_condition(lambda: False, "a condition that never lands", timeout=0.05)
+
+    with pytest.raises(pytest.fail.Exception, match="a condition that never lands"):
+        asyncio.run(never())
+
+
 def test_accepted_connections_set_tcp_nodelay(monkeypatch):
     """#620: asyncio skips TCP_NODELAY when an accepted socket reports proto 0, as it
     does on macOS and Windows, so Nagle held back small responses by about 50 ms."""
-    import asyncio
     import socket
 
     import uvicorn
@@ -957,18 +1681,22 @@ def test_accepted_connections_set_tcp_nodelay(monkeypatch):
                                 http=captured["http"], log_level="warning")
         server = uvicorn.Server(config)
         serving = asyncio.ensure_future(server.serve())
-        while not server.started:
-            await asyncio.sleep(0.01)
-        port = server.servers[0].sockets[0].getsockname()[1]
-        _, writer = await asyncio.open_connection("127.0.0.1", port)
-        while not server.server_state.connections:
-            await asyncio.sleep(0.01)
-        (conn,) = server.server_state.connections
-        nodelay = conn.transport.get_extra_info("socket").getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
-        writer.close()
-        server.should_exit = True
-        await serving
-        return nodelay
+        writer = None
+        try:
+            await _wait_for_condition(lambda: server.started, "uvicorn to bind and start serving")
+            port = server.servers[0].sockets[0].getsockname()[1]
+            _, writer = await asyncio.open_connection("127.0.0.1", port)
+            await _wait_for_condition(lambda: server.server_state.connections,
+                                      "the loopback connection to be accepted")
+            (conn,) = server.server_state.connections
+            return conn.transport.get_extra_info("socket").getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+        finally:
+            # A timed-out wait raises out of `drive()`, and the server task and the client
+            # connection would then outlive the test, so tear both down on every path.
+            if writer is not None:
+                writer.close()
+            server.should_exit = True
+            await asyncio.wait_for(serving, _WAIT_TIMEOUT)
 
     assert asyncio.run(drive())
 
@@ -1042,6 +1770,81 @@ def test_resolve_max_token_budget_fallback(monkeypatch, caplog):
     assert "invalid LAYA_MAX_TOKEN_BUDGET" in caplog.text
     assert "LAYA_MAX_TOKEN_BUDGET must be positive" in caplog.text
 
+
+def test_resolve_log_level_refuses_a_bad_value_by_name(monkeypatch):
+    """`LAYA_LOG_LEVEL` answers with a message about the variable, never a traceback.
+
+    uvicorn looks the value up in its own `LOG_LEVELS` with `.lower()` and no `.strip()`, so a typo,
+    a padded value copied out of a `.env`, and a blank `LAYA_LOG_LEVEL=` all raise a bare `KeyError`
+    from inside `configure_logging` -- and the key it prints is the lowercased one, which names
+    neither the variable nor the caller. The accepted names are read from `LOG_LEVELS` itself rather
+    than restated here, so the refusal cannot list a set uvicorn disagrees with.
+    """
+    from uvicorn.config import LOG_LEVELS
+
+    monkeypatch.delenv("LAYA_LOG_LEVEL", raising=False)
+    assert _resolve_log_level() == DEFAULT_LOG_LEVEL
+    for blank in ("", "  ", "\t"):
+        monkeypatch.setenv("LAYA_LOG_LEVEL", blank)
+        assert _resolve_log_level() == DEFAULT_LOG_LEVEL, repr(blank)
+
+    # Every spelling that worked before still works, case and padding included.
+    for name in sorted(LOG_LEVELS):
+        monkeypatch.setenv("LAYA_LOG_LEVEL", " %s " % name.upper())
+        assert _resolve_log_level() == name
+
+    for bad in ("verbose", "INFOO", "notset", "none", "0", "warn"):
+        monkeypatch.setenv("LAYA_LOG_LEVEL", bad)
+        with pytest.raises(SystemExit) as caught:
+            _resolve_log_level()
+        message = str(caught.value)
+        assert message == ("invalid LAYA_LOG_LEVEL %r: must be one of %s"
+                           % (bad, ", ".join(sorted(LOG_LEVELS)))), message
+
+
+def test_a_bad_log_level_is_refused_before_uvicorn_sees_it(monkeypatch):
+    """`main()` is where the level is handed over, so that is where the promise is checked."""
+    import uvicorn
+
+    import laya.serve
+
+    captured = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(laya.serve, "create_app", lambda: None)
+
+    monkeypatch.setenv("LAYA_LOG_LEVEL", "  WARNING  ")
+    laya.serve.main()
+    assert captured["log_level"] == "warning"
+
+    monkeypatch.setenv("LAYA_LOG_LEVEL", "")
+    captured.clear()
+    laya.serve.main()
+    assert captured["log_level"] == DEFAULT_LOG_LEVEL
+
+    captured.clear()
+    monkeypatch.setenv("LAYA_LOG_LEVEL", "verbose")
+    with pytest.raises(SystemExit, match=r"invalid LAYA_LOG_LEVEL 'verbose'"):
+        laya.serve.main()
+    assert captured == {}, "the refusal must happen before uvicorn.run is reached"
+
+
+def test_uvicorn_dies_on_the_values_the_resolver_refuses():
+    """The witness that the guard guards a real crash: this is uvicorn's own behaviour, unmediated.
+
+    No `laya` code is on this path, which is the point -- `laya-serve` passed the environment
+    straight through, so every `KeyError` here is one the CLI printed.
+    """
+    import uvicorn
+
+    async def app():
+        return None
+
+    for value in ("", " ", "verbose", "notset", "INFO "):
+        with pytest.raises(KeyError):
+            uvicorn.Config(app, host="127.0.0.1", port=0, log_level=value)
+    for accepted in ("info", "warning", "INFO"):
+        uvicorn.Config(app, host="127.0.0.1", port=0, log_level=accepted)
+
 BATCH_REQ = {
     "states": ["first state", "second state"],
     "questions": REQ["questions"],
@@ -1062,6 +1865,26 @@ def test_batch_happy_path(monkeypatch):
     assert len(fake.calls) == 2
     assert "Server-Timing" in r.headers
     assert "X-Inference-Time-Ms" in r.headers
+
+
+def test_batch_sums_output_tokens():
+    """total_usage must sum output_tokens, not report a hardcoded 0 (each result carries its own)."""
+    class _UsageRouter:
+        def predict(self, state, questions, model=None, **kwargs):
+            return {"model": "laya-rl-agent",
+                    "answers": {"dept": {"type": "choice", "choice": "billing",
+                                         "probabilities": {"billing": 1.0}, "confidence": 1.0}},
+                    "usage": {"input_tokens": 5, "output_tokens": 3},
+                    "routing": {"model": "english"}}
+
+    client = TestClient(create_app(router=_UsageRouter()))
+    r = client.post("/v1/systemone/batch", json=BATCH_REQ)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["total_usage"]["output_tokens"] == sum(
+        res["usage"]["output_tokens"] for res in data["results"])
+    assert data["total_usage"]["output_tokens"] == 6   # two states x 3 each
+    assert data["total_usage"]["input_tokens"] == 10
 
 
 def test_batch_missing_state_in_list_returns_400(monkeypatch):
@@ -1114,6 +1937,261 @@ def test_batch_too_many_states_returns_413(monkeypatch):
     r = client.post("/v1/systemone/batch", json=oversized)
     assert r.status_code == 413
     assert "too many states" in r.json()["detail"]
+
+
+def _noul_questions(n):
+    """`n` minimal questions, so a batch's row count is `len(states) * n` and nothing else."""
+    return {("q%03d" % i): {"type": "noul", "instructions": "is it urgent?"} for i in range(n)}
+
+
+def _batch_env_client(monkeypatch, **env):
+    """A batch client with the batch-token knob explicitly set, or explicitly unset.
+
+    Every test below states the budget it measures against. Without this an exported
+    `LAYA_MAX_BATCH_TOKENS` silently changes the chunk and these pass or fail for a reason that is not
+    in the file -- there is no `conftest.py` in this repo to isolate the environment, and
+    `_batch_client` clears only `LAYA_API_KEY`.
+    """
+    if "LAYA_MAX_BATCH_TOKENS" in env:
+        monkeypatch.setenv("LAYA_MAX_BATCH_TOKENS", env["LAYA_MAX_BATCH_TOKENS"])
+    else:
+        monkeypatch.delenv("LAYA_MAX_BATCH_TOKENS", raising=False)
+    return _batch_client(monkeypatch)
+
+
+def _sent_batch_size(fake):
+    """The `batch_size` the route handed `predict_batch`, or the sentinel when it passed none."""
+    _, kwargs = fake.batch_calls[0]
+    return kwargs["batch_size"] if "batch_size" in kwargs else "<absent>"
+
+
+# --------------------------------------------------------------------- the batch token budget
+#
+# `/v1/systemone/batch` collates `states x questions` rows into one tensor and `batch_size` defaults to
+# `None` -- "all in one pass" -- so the two field caps multiply: 64 states of 64 questions is 4096 rows
+# from a 4.1 KB body. The budget SPLITS the work rather than refusing it, because a refusal would have
+# to be right about hardware this process cannot see: measured on english, peak RSS did not move
+# between 32, 64 and 128 rows. So the contract under test is "one pass stays inside the budget, and a
+# request that already fits is passed no `batch_size` at all".
+
+def test_batch_within_the_budget_is_passed_no_batch_size(monkeypatch):
+    """A request that fits must behave byte-identically, which means not passing `batch_size`.
+
+    `predict_batch` warns that changing batch shapes can move floating-point results, so a request
+    that works today must not start answering differently. Not-passing is the only way to guarantee
+    that: it leaves `predict_batch` on its own default.
+    """
+    import laya.serve as serve_mod
+
+    client, fake = _batch_env_client(monkeypatch)
+    rows = serve_mod.DEFAULT_MAX_BATCH_TOKENS // serve_mod._BATCH_ROW_TOKENS_ASSUMED
+    r = client.post("/v1/systemone/batch",
+                    json={"states": ["hi"] * 8, "questions": _noul_questions(rows // 8)})
+    assert r.status_code == 200, r.text
+    requests, kwargs = fake.batch_calls[0]
+    assert len(requests) * len(requests[0]["questions"]) == rows, "exactly at the budget"
+    assert "batch_size" not in kwargs, kwargs
+
+
+def test_batch_over_the_budget_is_split_not_refused(monkeypatch):
+    """The 4096-row shape still answers; it is chunked so one pass stays inside the budget."""
+    import laya.serve as serve_mod
+
+    client, fake = _batch_env_client(monkeypatch)
+    r = client.post("/v1/systemone/batch",
+                    json={"states": ["hi"] * serve_mod.MAX_BATCH_STATES,
+                          "questions": _noul_questions(serve_mod.MAX_QUESTIONS)})
+    assert r.status_code == 200, r.text
+    rows_per_pass = serve_mod.DEFAULT_MAX_BATCH_TOKENS // serve_mod._BATCH_ROW_TOKENS_ASSUMED
+    expected = max(1, rows_per_pass // serve_mod.MAX_QUESTIONS)
+    assert _sent_batch_size(fake) == expected
+    requests, _ = fake.batch_calls[0]
+    assert len(requests) == serve_mod.MAX_BATCH_STATES, "every state is still sent"
+    assert expected * serve_mod.MAX_QUESTIONS * serve_mod._BATCH_ROW_TOKENS_ASSUMED \
+        <= serve_mod.DEFAULT_MAX_BATCH_TOKENS, "one pass must fit the budget"
+
+
+def test_batch_one_row_over_the_budget_is_split(monkeypatch):
+    """One row over, with both factors inside their own caps, so the comparison cannot be off by one."""
+    import laya.serve as serve_mod
+
+    client, fake = _batch_env_client(monkeypatch)
+    rows = serve_mod.DEFAULT_MAX_BATCH_TOKENS // serve_mod._BATCH_ROW_TOKENS_ASSUMED
+    states, questions = 9, rows // 8
+    assert states <= serve_mod.MAX_BATCH_STATES and questions <= serve_mod.MAX_QUESTIONS
+    assert states * questions > rows, "must be over by at least one row"
+    r = client.post("/v1/systemone/batch",
+                    json={"states": ["hi"] * states, "questions": _noul_questions(questions)})
+    assert r.status_code == 200, r.text
+    assert _sent_batch_size(fake) == max(1, rows // questions)
+
+
+def test_batch_a_raised_max_len_chunks_harder(monkeypatch):
+    """A row cap would be the wrong bound, because `max_len` is a request field.
+
+    `max_len` is capped only by `DEFAULT_MAX_TOKEN_BUDGET` (8192), 16x the english checkpoint's own
+    512, so 256 rows at 8192 is the same token count as 4096 rows at 512 and collates the same tensor.
+    Counting tokens means a wider row buys proportionally fewer rows per pass.
+    """
+    import laya.serve as serve_mod
+
+    wide = serve_mod.DEFAULT_MAX_TOKEN_BUDGET
+    assert wide > serve_mod._BATCH_ROW_TOKENS_ASSUMED
+    rows = serve_mod.DEFAULT_MAX_BATCH_TOKENS // serve_mod._BATCH_ROW_TOKENS_ASSUMED
+
+    narrow_client, narrow = _batch_env_client(monkeypatch)
+    narrow_client.post("/v1/systemone/batch",
+                       json={"states": ["hi"] * 8, "questions": _noul_questions(rows // 8)})
+    assert "batch_size" not in narrow.batch_calls[0][1], "fits at the default width"
+
+    wide_client, wide_fake = _batch_env_client(monkeypatch)
+    r = wide_client.post("/v1/systemone/batch",
+                         json={"states": ["hi"] * 8, "questions": _noul_questions(rows // 8),
+                               "max_len": wide})
+    assert r.status_code == 200, r.text
+    rows_per_pass = serve_mod.DEFAULT_MAX_BATCH_TOKENS // wide
+    assert _sent_batch_size(wide_fake) == max(1, rows_per_pass // (rows // 8))
+
+
+def test_batch_an_explicit_batch_size_shapes_a_pass_but_cannot_widen_one(monkeypatch):
+    """The caller asked for a shape, not for an unbounded pass.
+
+    `batch_size` is the only knob that decides what ONE forward pass collates, and the plan above is
+    the only thing that keeps that pass inside `LAYA_MAX_BATCH_TOKENS`. Forwarding the caller's value
+    verbatim made the budget opt-out: `batch_size=10**18` on a 4 KB body meant one pass over 524 288
+    tokens (64 states x 8192) with every documented limit satisfied. A smaller value still wins,
+    because asking for a *narrower* pass is asking for less work than the plan allows.
+    """
+    import laya.serve as serve_mod
+
+    rows_that_do_not_fit = {"states": ["hi"] * serve_mod.MAX_BATCH_STATES,
+                            "questions": _noul_questions(serve_mod.MAX_QUESTIONS)}
+    planned = serve_mod._batch_chunk_size(serve_mod.MAX_BATCH_STATES, serve_mod.MAX_QUESTIONS, None)
+    assert planned is not None and planned < serve_mod.MAX_BATCH_STATES
+
+    # Narrower than the plan: the caller's own shape.
+    client, fake = _batch_env_client(monkeypatch)
+    r = client.post("/v1/systemone/batch", json={**rows_that_do_not_fit, "batch_size": 1})
+    assert r.status_code == 200, r.text
+    assert _sent_batch_size(fake) == 1
+
+    # Wider than the plan, including absurdly wider: capped at the plan.
+    for asked in (planned + 1, 7 if 7 > planned else planned + 1, 10 ** 18):
+        client, fake = _batch_env_client(monkeypatch)
+        r = client.post("/v1/systemone/batch", json={**rows_that_do_not_fit, "batch_size": asked})
+        assert r.status_code == 200, r.text
+        assert _sent_batch_size(fake) == planned, (asked, planned)
+
+    # A batch that already fits is passed no plan at all, so the caller's value is forwarded as-is.
+    client, fake = _batch_env_client(monkeypatch)
+    r = client.post("/v1/systemone/batch",
+                    json={"states": ["hi"] * 8, "questions": _noul_questions(2), "batch_size": 7})
+    assert r.status_code == 200, r.text
+    assert _sent_batch_size(fake) == 7
+
+
+def test_batch_chunking_follows_a_raised_budget(monkeypatch):
+    """A deployment whose hardware can take more stops being chunked."""
+    import laya.serve as serve_mod
+
+    client, fake = _batch_env_client(monkeypatch, LAYA_MAX_BATCH_TOKENS="2097152")
+    r = client.post("/v1/systemone/batch",
+                    json={"states": ["hi"] * serve_mod.MAX_BATCH_STATES,
+                          "questions": _noul_questions(serve_mod.MAX_QUESTIONS)})
+    assert r.status_code == 200, r.text
+    assert "batch_size" not in fake.batch_calls[0][1], "4096 rows x 512 fits a 2 097 152 budget"
+
+
+def test_batch_chunking_follows_a_lowered_budget(monkeypatch):
+    """And a LOWERED one -- the regime an operator on small hardware actually uses."""
+    import laya.serve as serve_mod
+
+    assert 2048 < serve_mod.DEFAULT_MAX_BATCH_TOKENS, "2048 must be the lowered regime"
+    client, fake = _batch_env_client(monkeypatch, LAYA_MAX_BATCH_TOKENS="2048")
+    r = client.post("/v1/systemone/batch",
+                    json={"states": ["hi"] * 8, "questions": _noul_questions(2)})
+    assert r.status_code == 200, r.text
+    # 2048 / 512 = 4 rows per pass, / 2 questions = 2 states per pass
+    assert _sent_batch_size(fake) == 2
+
+
+@pytest.mark.parametrize("raw", ["nonsense", "0", "-5", "3.5"])
+def test_batch_budget_warns_and_falls_back_on_an_unusable_value(monkeypatch, caplog, raw):
+    """A bad knob must not disable the chunking, and must say so in the log."""
+    import laya.serve as serve_mod
+
+    monkeypatch.setenv("LAYA_MAX_BATCH_TOKENS", raw)
+    with caplog.at_level(logging.WARNING, logger="laya.serve"):
+        assert serve_mod._resolve_max_batch_tokens() == serve_mod.DEFAULT_MAX_BATCH_TOKENS
+    assert "LAYA_MAX_BATCH_TOKENS" in caplog.text, caplog.text
+    assert ("invalid" in caplog.text or "must be positive" in caplog.text), caplog.text
+
+    client, fake = _batch_client(monkeypatch)
+    r = client.post("/v1/systemone/batch",
+                    json={"states": ["hi"] * serve_mod.MAX_BATCH_STATES,
+                          "questions": _noul_questions(serve_mod.MAX_QUESTIONS)})
+    assert r.status_code == 200, r.text
+    assert _sent_batch_size(fake) != "<absent>", "the fallback budget must still chunk"
+
+
+def test_batch_an_empty_environment_value_falls_back_silently(monkeypatch):
+    """Unset and empty both mean "not configured", which is not worth a warning."""
+    import laya.serve as serve_mod
+
+    monkeypatch.setenv("LAYA_MAX_BATCH_TOKENS", "")
+    assert serve_mod._resolve_max_batch_tokens() == serve_mod.DEFAULT_MAX_BATCH_TOKENS
+
+
+def test_batch_chunk_plan_floors_at_one_state(monkeypatch):
+    """A single state cannot be split, so the plan stops at one state per pass and never 0.
+
+    At that floor one pass carries `len(questions)` rows, which is exactly what one `/v1/systemone`
+    request can already ask for -- so the batch route's worst pass is the single route's worst pass.
+    """
+    import laya.serve as serve_mod
+
+    monkeypatch.delenv("LAYA_MAX_BATCH_TOKENS", raising=False)
+    plan = serve_mod._batch_chunk_size(serve_mod.MAX_BATCH_STATES, serve_mod.MAX_QUESTIONS,
+                                       serve_mod.DEFAULT_MAX_TOKEN_BUDGET)
+    assert plan == 1, plan
+    assert serve_mod._batch_chunk_size(1, serve_mod.MAX_QUESTIONS,
+                                       serve_mod.DEFAULT_MAX_TOKEN_BUDGET) == 1
+
+
+@pytest.mark.parametrize("states,questions", [(0, 4), (4, 0), (0, 0)])
+def test_batch_chunk_plan_is_none_for_a_degenerate_shape(monkeypatch, states, questions):
+    """Nothing to split, and no division by the question count."""
+    import laya.serve as serve_mod
+
+    monkeypatch.delenv("LAYA_MAX_BATCH_TOKENS", raising=False)
+    assert serve_mod._batch_chunk_size(states, questions) is None
+
+
+def test_batch_an_empty_questions_body_is_not_chunked(monkeypatch):
+    """Zero rows: no plan, no crash, and `predict_batch` short-circuits on its own."""
+    client, fake = _batch_env_client(monkeypatch)
+    r = client.post("/v1/systemone/batch", json={"states": ["hi"] * 8, "questions": {}})
+    assert r.status_code == 200, r.text
+    assert "batch_size" not in fake.batch_calls[0][1]
+
+
+def test_batch_a_non_object_questions_body_keeps_its_own_400(monkeypatch):
+    """The planner must not turn a 400 into something else by calling len() on a list."""
+    client, _ = _batch_env_client(monkeypatch)
+    r = client.post("/v1/systemone/batch", json={"states": ["hi"] * 8, "questions": ["nope"] * 300})
+    assert r.status_code == 400, r.text
+    assert "'questions' must be an object" in r.json()["detail"], r.json()["detail"]
+
+
+def test_batch_too_many_questions_still_gets_its_own_413(monkeypatch):
+    """Chunking does not replace the per-question cap: 300 questions is still refused, by name."""
+    import laya.serve as serve_mod
+
+    client, _ = _batch_env_client(monkeypatch)
+    r = client.post("/v1/systemone/batch",
+                    json={"states": ["hi"], "questions": _noul_questions(serve_mod.MAX_QUESTIONS + 1)})
+    assert r.status_code == 413, r.text
+    assert "too many questions" in r.json()["detail"], r.json()["detail"]
 
 
 def test_batch_individual_oversized_state_returns_413(monkeypatch):
@@ -1247,6 +2325,97 @@ def test_an_unpaired_surrogate_is_a_caller_error_not_a_server_fault():
                       headers={"content-type": "application/json"})
     assert res.status_code == 200, (res.status_code, res.text)
     assert seen and "\U0001f600" in str(seen[0]), seen
+
+
+def _lone_surrogate_bodies(batch):
+    r"""Every slot 06462bf lists a `\udXXX` escape can hide in, shaped for the route asked about.
+
+    Built from one table rather than copied from the single-route test above, because the point is
+    that both routes see the same strings -- and a batch carries more than one state, so an escape
+    in the second of them is enough to reach the tokenizer. Each body is otherwise a request that
+    answers 200, so a refusal can only be about the escape.
+    """
+    plain = {"q": {"type": "noul", "instructions": "x"}}
+    slots = {
+        "state": {"states": ["ok", "\ud800"], "questions": plain} if batch
+        else {"state": "\ud800", "questions": plain},
+        "instructions": {"questions": {"q": {"type": "noul", "instructions": "\udfff"}}},
+        "criteria label": {"questions": {"q": {"type": "choice", "instructions": "x",
+                                               "criteria": {"\ud800": "a", "b": "c"}}}},
+    }
+    for label, body in slots.items():
+        if label != "state":
+            body["states" if batch else "state"] = ["ok"] if batch else "ok"
+    return slots
+
+
+def _surrogate_client():
+    router = BatchCapableFakeRouter()
+    return TestClient(create_app(router=router), raise_server_exceptions=False), router
+
+
+@pytest.mark.parametrize("path,batch",
+                         [("/v1/systemone", False), ("/v1/systemone/batch", True)],
+                         ids=["single", "batch"])
+@pytest.mark.parametrize("slot", sorted(_lone_surrogate_bodies(False)))
+def test_both_decision_routes_refuse_the_escape_before_the_router_sees_it(path, batch, slot,
+                                                                         monkeypatch):
+    r"""`/v1/systemone/batch` tokenizes the same body and had no guard on it.
+
+    06462bf turned a lone `\udXXX` escape into a `400` on the single route and recorded what it had
+    not covered: "only `/v1/systemone` is checked". The batch route went on walking no guard, so the
+    identical string reached the tokenizer there. Measured on the cached `english` checkpoint, CPU,
+    before this change:
+
+    ```
+    slot              Router.predict        Router.predict_batch     HTTP single  HTTP batch
+    state             TypeError             TypeError                400          200
+    instructions      TypeError             TypeError                400          200
+    criteria label    TypeError             TypeError                400          200
+    paired emoji      ok (1 answers)        ok (1 answers)           200          200
+    ```
+
+    None of those batch `200`s mean the escape is harmless. The HTTP columns were measured with a
+    stub router that does not tokenize -- the handler builds one request per state and hands them to
+    `predict_batch`, which raises the `TypeError` above for all three slots on the real one, so each
+    is a `500 inference failed` on a live server plus a `_log.exception` traceback per request. That
+    is exactly the shape 06462bf was written to stop. So each slot is its own case, the message is
+    read from `laya.serve` rather than retyped here, and the router is asserted to have seen
+    nothing: the refusal has to land before the forward pass it exists to prevent.
+    """
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    client, router = _surrogate_client()
+    body = _lone_surrogate_bodies(batch)[slot]
+    # `json.dumps` escapes the unpaired surrogate by default, which is what a client sending one of
+    # these puts on the wire: pure ASCII that `json.loads` turns back into an unencodable character.
+    res = client.post(path, content=json.dumps(body).encode("ascii"),
+                      headers={"content-type": "application/json"})
+    assert res.status_code == 400, (slot, res.status_code, res.text)
+    assert _LONE_SURROGATE_DETAIL in res.text, (slot, res.text)
+    assert not router.calls and not router.batch_calls, (
+        "%s was refused after it reached inference: %r %r" % (slot, router.calls, router.batch_calls))
+
+
+@pytest.mark.parametrize("path,batch",
+                         [("/v1/systemone", False), ("/v1/systemone/batch", True)],
+                         ids=["single", "batch"])
+def test_an_emoji_still_reaches_both_decision_routes(path, batch, monkeypatch):
+    """A *paired* surrogate is one astral character by the time the parser is done.
+
+    The other half of the guard: a check keyed on surrogate code points rather than on
+    unpairedness would reject every emoji a state contains, which is why 06462bf asserts it for the
+    single route and it is asserted here for both.
+    """
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    client, router = _surrogate_client()
+    body = {"states": ["hi \U0001f600"]} if batch else {"state": "hi \U0001f600"}
+    body["questions"] = {"q": {"type": "noul", "instructions": "x"}}
+    res = client.post(path, content=json.dumps(body).encode("utf-8"),
+                      headers={"content-type": "application/json"})
+    assert res.status_code == 200, (res.status_code, res.text)
+    states = ([r["state"] for r in router.batch_calls[-1]] if batch
+              else [router.calls[-1]["state"]])
+    assert any("\U0001f600" in str(s) for s in states), states
 
 
 def test_a_deeply_nested_state_is_not_a_recursion_error():
@@ -1747,3 +2916,1477 @@ def test_http_api_page_documents_exactly_the_forwarded_controls():
     prose = page[page.index("`model`, `task`, `lang`, `lang_guess`"):]
     for key in BODY_REFUSALS:
         assert "`%s`" % key in prose, "%s is not named where the refusal is explained" % key
+
+
+# --------------------------------------------------------------------- batch endpoint per-call controls
+#
+# `Router.predict_batch` reads two kinds of control: call-level kwargs that apply to the whole
+# batch (chunking, padding, abstention) and per-request keys it lifts off each item of ``requests``
+# (checkpoint, task, language, token budget). Before this PR, the HTTP batch endpoint read neither
+# -- it always synthesized a plain ``{state, questions, model}`` dict and called ``predict_batch``
+# with no kwargs, so a caller could not send any of the controls the single endpoint already
+# forwards. The suite below pins the two split lists against core's own signature, verifies every
+# control reaches the right side of the Router call, and refuses a hook control the same way
+# ``/v1/systemone`` already does.
+
+
+class BatchRecordingRouter(FakeRouter):
+    """Records ``predict_batch``'s full call: the requests list and every call kwarg."""
+
+    def __init__(self):
+        super().__init__()
+        self.batch_calls = []
+
+    def predict_batch(self, requests, **kwargs):
+        self.batch_calls.append(([dict(r) for r in requests], dict(kwargs)))
+        return [
+            {
+                "model": "laya-rl-agent",
+                "answers": {
+                    "dept": {
+                        "type": "choice",
+                        "choice": "billing",
+                        "probabilities": {"billing": 0.94, "tech": 0.06},
+                        "confidence": 0.94,
+                    }
+                },
+                "usage": {"input_tokens": 42, "output_tokens": 0},
+                "routing": {"model": "english", "reason": "English Latin text"},
+            }
+            for _ in requests
+        ]
+
+
+class StrictBatchRouter(BatchRecordingRouter):
+    """``predict_batch(self, requests)`` -- takes no call kwargs.
+
+    Witness against an always-forward mutation: if the handler unconditionally passed ``batch_size``
+    or ``min_confidence``, this Router would raise ``TypeError`` and 500 on a bare body.
+    """
+
+    def predict_batch(self, requests):  # noqa: D401 -- strict on purpose
+        return super().predict_batch(requests)
+
+
+BATCH_CALL_VALUES = {"batch_size": 4, "min_confidence": 0.9, "sort_by_length": True}
+BATCH_ITEM_VALUES = {"max_len": 64, "head_max_len": 32, "task": "typed-decisions",
+                     "lang": "de", "lang_guess": "de"}
+
+
+def _batch_client(monkeypatch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    fake = BatchRecordingRouter()
+    return TestClient(create_app(router=fake)), fake
+
+
+def test_batch_call_controls_are_exactly_predict_batch_kwargs_or_refusal():
+    """A control added to ``Router.predict_batch`` must be placed on one side of the line.
+
+    Either serve forwards it (``BATCH_BODY_CALL_CONTROLS``) or it refuses it (``hooks_timeout``,
+    the one hook-execution arg that ``predict_batch`` takes, and ``diagnostics``, the out-parameter
+    HTTP cannot hand back). Silently ignoring a new kwarg is the failure mode this pin exists to
+    catch: the same reasoning that made ``/v1/systemone`` refuse ``hooks_timeout`` in #724 applies
+    to the batch path -- a caller cannot shorten the deadline on which the operator's own hooks
+    execute.
+    """
+    from laya.router import Router
+
+    taken = set(inspect.signature(Router.predict_batch).parameters) - {"self", "requests"}
+    declared = (set(BATCH_BODY_CALL_CONTROLS) | set(BODY_REFUSALS)
+                | set(BATCH_BODY_OUT_PARAMETERS))
+    assert not (set(BATCH_BODY_CALL_CONTROLS) & set(BATCH_BODY_OUT_PARAMETERS))
+    assert taken == declared, "predict_batch() takes %s; serve declares %s" % (
+        sorted(taken), sorted(declared))
+
+
+def test_batch_controls_cover_the_single_endpoints_set_plus_batch_only():
+    """Everything the single endpoint forwards must reach the batch path too, and vice versa.
+
+    The batch forwards the same per-call controls ``/v1/systemone`` does -- split across the item
+    dict (``Router.predict_batch`` reads them per item) and the call kwargs (min_confidence) --
+    plus the batch-only chunking and padding knobs (``batch_size``, ``sort_by_length``) that
+    ``predict_batch`` accepts and ``predict`` does not. ``model`` still goes into every item, as
+    it has since the batch endpoint shipped. If a control moves across either boundary, this
+    test names it.
+    """
+    batch_side = set(BATCH_BODY_ITEM_CONTROLS) | set(BATCH_BODY_CALL_CONTROLS)
+    single_side = (set(BODY_CONTROLS) | {"batch_size", "sort_by_length"}) - {"model"}
+    assert batch_side == single_side, (
+        "batch forwards %s; single endpoint + batch-only says %s"
+        % (sorted(batch_side), sorted(single_side)))
+
+
+@pytest.mark.parametrize("key", sorted(BATCH_ITEM_VALUES))
+def test_each_batch_item_control_reaches_every_request(monkeypatch, key):
+    client, fake = _batch_client(monkeypatch)
+    r = client.post("/v1/systemone/batch", json={**BATCH_REQ, key: BATCH_ITEM_VALUES[key]})
+    assert r.status_code == 200, r.text
+    requests, _ = fake.batch_calls[0]
+    assert len(requests) == len(BATCH_REQ["states"])
+    for item in requests:
+        assert item.get(key) == BATCH_ITEM_VALUES[key], (key, item)
+
+
+@pytest.mark.parametrize("key", sorted(BATCH_CALL_VALUES))
+def test_each_batch_call_control_reaches_predict_batch_kwargs(monkeypatch, key):
+    client, fake = _batch_client(monkeypatch)
+    r = client.post("/v1/systemone/batch", json={**BATCH_REQ, key: BATCH_CALL_VALUES[key]})
+    assert r.status_code == 200, r.text
+    _, kwargs = fake.batch_calls[0]
+    assert kwargs.get(key) == BATCH_CALL_VALUES[key], (key, kwargs)
+
+
+def test_batch_unset_controls_are_not_sent_as_none(monkeypatch):
+    """An absent control must stay absent in either the item dict or the call kwargs.
+
+    Core reads an absent argument as "inherit what the Router was built with", so sending
+    ``min_confidence=None`` would override a deployment's ``Router(min_confidence=...)``, and
+    sending a per-item key with value ``None`` would break a Router whose ``predict_batch``
+    predates the key (#294 shape).
+    """
+    client, fake = _batch_client(monkeypatch)
+    assert client.post("/v1/systemone/batch", json=BATCH_REQ).status_code == 200
+    requests, kwargs = fake.batch_calls[0]
+    assert kwargs == {}
+    for item in requests:
+        for key in BATCH_BODY_ITEM_CONTROLS:
+            assert key not in item, (key, item)
+
+
+@pytest.mark.parametrize("key", sorted(set(BATCH_ITEM_VALUES) | set(BATCH_CALL_VALUES)))
+def test_batch_explicit_null_is_no_control(monkeypatch, key):
+    """``{"lang_guess": null}`` means "no hint" -- same shape the single endpoint honours.
+
+    A Jev client that serialises its absent fields must keep working; only a value says the
+    caller asked for something.
+    """
+    client, fake = _batch_client(monkeypatch)
+    assert client.post("/v1/systemone/batch", json={**BATCH_REQ, key: None}).status_code == 200
+    requests, kwargs = fake.batch_calls[0]
+    assert "min_confidence" not in kwargs and "batch_size" not in kwargs
+    assert "sort_by_length" not in kwargs
+    for item in requests:
+        assert key not in item
+
+
+def test_batch_min_confidence_zero_is_still_a_threshold(monkeypatch):
+    """``0.0`` is falsy but is a value the caller chose; ``if min_confidence:`` would drop it."""
+    client, fake = _batch_client(monkeypatch)
+    assert client.post("/v1/systemone/batch",
+                       json={**BATCH_REQ, "min_confidence": 0.0}).status_code == 200
+    _, kwargs = fake.batch_calls[0]
+    assert kwargs["min_confidence"] == 0.0
+
+
+def test_batch_sort_by_length_false_is_not_forwarded(monkeypatch):
+    """``predict_batch``'s own default is ``False``, so ``False`` is what the caller did NOT ask.
+
+    Forwarding ``False`` explicitly would still work on ``Router`` but silently disappear on any
+    attached agent whose ``predict_batch`` predates the knob (#294) -- which is why the MCP tool
+    makes the same choice. The endpoint does accept the value; it just does not translate it into
+    a kwarg.
+    """
+    client, fake = _batch_client(monkeypatch)
+    assert client.post("/v1/systemone/batch",
+                       json={**BATCH_REQ, "sort_by_length": False}).status_code == 200
+    _, kwargs = fake.batch_calls[0]
+    assert "sort_by_length" not in kwargs
+
+
+def test_batch_strict_predict_batch_router_answers_a_quiet_body(monkeypatch):
+    """An attached Router whose ``predict_batch(self, requests)`` takes nothing else must still work.
+
+    The endpoint forwards kwargs only when the caller asks. If the handler always passed
+    ``batch_size=None`` (or any call kwarg) unconditionally, this Router would raise ``TypeError``
+    and the endpoint would 500 on a body that sent nothing -- which is exactly the mutation this
+    witness kills.
+    """
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    fake = StrictBatchRouter()
+    client = TestClient(create_app(router=fake))
+    r = client.post("/v1/systemone/batch", json=BATCH_REQ)
+    assert r.status_code == 200, r.text
+    assert len(fake.batch_calls) == 1
+    _, kwargs = fake.batch_calls[0]
+    assert kwargs == {}
+
+
+@pytest.mark.parametrize("key,value", [
+    ("lang", True),
+    ("lang", 5),
+    ("lang_guess", ["de"]),
+    ("lang_guess", {"code": "de"}),
+    ("max_len", 0),
+    ("max_len", -1),
+    ("max_len", True),
+    ("max_len", "64"),
+    ("head_max_len", "32"),
+    ("min_confidence", 1.5),
+    ("min_confidence", -0.1),
+    ("min_confidence", "0.9"),
+    ("batch_size", 0),
+    ("batch_size", -3),
+    ("batch_size", True),
+    ("batch_size", 1.5),
+    ("batch_size", "4"),
+    ("sort_by_length", "yes"),
+    ("sort_by_length", 1),
+])
+def test_bad_control_on_batch_is_refused_before_inference(monkeypatch, key, value):
+    client, fake = _batch_client(monkeypatch)
+    r = client.post("/v1/systemone/batch", json={**BATCH_REQ, key: value})
+    assert r.status_code == 422, (key, value, r.text)
+    assert not fake.batch_calls, "a refused body must not reach predict_batch"
+
+
+@pytest.mark.parametrize("key", BODY_REFUSALS)
+def test_batch_hook_control_is_refused_not_dropped(monkeypatch, key):
+    """The batch endpoint must honour the same refusal policy the single endpoint already states.
+
+    Without ``_refuse_body_refusals``, a batch body would silently hand a caller a shorter
+    deadline for the operator's hooks -- ``predict_batch`` *does* take ``hooks_timeout`` as a
+    call arg, so this is not a theoretical refusal here. The other four are refused for the same
+    reason they are on ``/v1/systemone``: they run inside the server process.
+    """
+    value = {"hooks": [], "on_predict_start": "cache", "on_predict_end": "audit",
+             "hooks_raise": False, "hooks_timeout": 5.0}[key]
+    client, fake = _batch_client(monkeypatch)
+    r = client.post("/v1/systemone/batch", json={**BATCH_REQ, key: value})
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert key in detail
+    assert "cannot be sent to this endpoint" in detail
+    assert not fake.batch_calls, "the refusal must come before inference"
+
+
+@pytest.mark.parametrize("key", BATCH_BODY_OUT_PARAMETERS)
+def test_batch_out_parameter_is_refused_not_filled_and_dropped(monkeypatch, key):
+    """``diagnostics`` is written into the caller's own dict, which an HTTP caller does not have.
+
+    ``Router.predict_batch`` takes it so a local caller -- the CLI, for #1111 -- can read which
+    checkpoint groups actually reordered. Over HTTP there is nothing to read it back from, so a
+    body that sent it would be answered 200 while the report it asked for was discarded with the
+    request. Refused instead, for the reason ``BODY_REFUSALS`` is: an unhonourable control is
+    reported, never ignored.
+    """
+    client, fake = _batch_client(monkeypatch)
+    r = client.post("/v1/systemone/batch", json={**BATCH_REQ, key: {}})
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert key in detail
+    assert "cannot be returned over HTTP" in detail
+    assert not fake.batch_calls, "the refusal must come before inference"
+    # An explicit null is "not asked for", the way every other control reads it.
+    ok = client.post("/v1/systemone/batch", json={**BATCH_REQ, key: None})
+    assert ok.status_code == 200, ok.text
+    assert key not in fake.batch_calls[0][1]
+
+
+def test_batch_predict_fallback_forwards_every_control(monkeypatch):
+    """When the attached Router has no ``predict_batch``, every control must reach ``predict()``.
+
+    The batch path synthesizes per-state ``predict()`` calls with the same kwargs the single
+    endpoint uses -- ``max_len``/``head_max_len``/``task``/``lang``/``lang_guess``/``min_confidence``
+    all apply per call. A caller that sends ``min_confidence`` on a batch body must see the
+    abstention gate apply per item on the fallback path, not silently skip it because
+    ``predict_batch`` was unavailable.
+    """
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    fake = BudgetRouter()
+    client = TestClient(create_app(router=fake))
+    body = {**BATCH_REQ, "max_len": 64, "head_max_len": 32, "task": "typed-decisions",
+            "lang": "de", "lang_guess": "de", "min_confidence": 0.5}
+    r = client.post("/v1/systemone/batch", json=body)
+    assert r.status_code == 200, r.text
+    assert len(fake.calls) == len(BATCH_REQ["states"])
+    for call in fake.calls:
+        assert call["max_len"] == 64
+        assert call["head_max_len"] == 32
+        assert call["task"] == "typed-decisions"
+        assert call["lang"] == "de"
+        assert call["lang_guess"] == "de"
+        assert call["min_confidence"] == 0.5
+
+
+def test_batch_predict_fallback_sends_no_kwargs_when_body_is_quiet(monkeypatch):
+    """A quiet batch body on the fallback path must call ``predict()`` with no kwargs at all.
+
+    An attached Router whose ``predict()`` does not take the new keywords -- the ``FakeRouter``
+    class this suite has always used -- must keep answering on a bare batch. Passing ``None``
+    would 500 on that shape and would override a deployment's own ``Router(lang_guess=...)``
+    on a modern one.
+    """
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    fake = FakeRouter()
+    client = TestClient(create_app(router=fake))
+    r = client.post("/v1/systemone/batch", json=BATCH_REQ)
+    assert r.status_code == 200, r.text
+    assert len(fake.calls) == len(BATCH_REQ["states"])
+
+
+def test_batch_controls_combine_on_one_call(monkeypatch):
+    """Call kwargs and item overrides land on the same call, not in isolation.
+
+    A caller that sends a token budget and a chunking cap together must see them on the same
+    ``predict_batch`` invocation -- not the budget on the item and the chunk cap dropped, and
+    not the reverse. This is the whole-point-of-the-PR shape.
+    """
+    client, fake = _batch_client(monkeypatch)
+    r = client.post("/v1/systemone/batch",
+                    json={**BATCH_REQ, "batch_size": 2, "sort_by_length": True,
+                          "min_confidence": 0.8, "task": "typed-decisions", "max_len": 128})
+    assert r.status_code == 200, r.text
+    requests, kwargs = fake.batch_calls[0]
+    assert kwargs == {"min_confidence": 0.8, "batch_size": 2, "sort_by_length": True}
+    for item in requests:
+        assert item["task"] == "typed-decisions"
+        assert item["max_len"] == 128
+def test_health_liveness_is_open_but_the_detail_needs_the_bearer(monkeypatch):
+    """#812: `/health` answered deployment internals to an unauthenticated caller.
+
+    `POST /v1/systemone` was gated and `GET /health` was not, so on a server the operator had
+    locked down with `LAYA_API_KEY` anyone could read the resident checkpoint names, each one's
+    exact Hugging Face revision SHA, the device state, and `last_fallback_reason`, which quotes
+    host hardware ("GPU 0 total 8.00 GiB"). Reconnaissance rather than a data path, but it is
+    exactly the inventory you would want before targeting a revision.
+
+    Requiring the bearer outright was not the fix: `compose.http.yaml`'s healthcheck, the Docker
+    HEALTHCHECK and any k8s liveness probe all read this endpoint with no credential, and
+    docs/http-api.md promises it is always open. So liveness stays open and the detail does not.
+    """
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("LAYA_API_KEY", "s3cret")
+    client = TestClient(create_app(router=FakeRouter()))
+
+    # a probe with no credential still gets its 200, which is all a healthcheck reads
+    anonymous = client.get("/health")
+    assert anonymous.status_code == 200
+    assert anonymous.json() == {"status": "ok"}
+
+    # and the same for a wrong bearer: still live, still no detail, and not a 401, because a
+    # probe that starts failing on a bad credential is a worse outage than the disclosure
+    wrong = client.get("/health", headers={"Authorization": "Bearer nope"})
+    assert wrong.status_code == 200
+    assert wrong.json() == {"status": "ok"}
+
+    # the detail is the authorized caller's
+    full = client.get("/health", headers={"Authorization": "Bearer s3cret"})
+    assert full.status_code == 200
+    _, returned = _health_return_keys()
+    assert sorted(full.json()) == sorted(returned)
+    for leaked in ("loaded", "revisions", "cpu_fallbacks", "checkpoint_devices"):
+        assert leaked in full.json()
+        assert leaked not in anonymous.json()
+
+
+def test_health_without_an_api_key_is_unchanged(monkeypatch):
+    """A deployment that set no key never asked to be gated, so it gets the whole payload."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    monkeypatch.delenv("LAYA_IDLE_UNLOAD_SECONDS", raising=False)
+    client = TestClient(create_app(router=FakeRouter()))
+    _, returned = _health_return_keys()
+    assert sorted(client.get("/health").json()) == sorted(returned)
+
+
+def _health_return_keys():
+    """The keys `health()` hands back, read out of its own `return` statement."""
+    path = os.path.join(ROOT, "laya", "serve.py")
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=path)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "health":
+            for stmt in node.body:
+                if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Dict):
+                    return node, [k.value for k in stmt.value.keys
+                                  if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+    raise AssertionError("no `def health()` returning a dict literal in laya/serve.py")
+
+
+def test_http_api_page_documents_exactly_the_health_fields():
+    """The payload `/health` documents has to be the payload the handler builds.
+
+    The page showed four keys while the handler returned seven: `device_is_preference`,
+    `checkpoint_devices` and `cpu_fallbacks` arrived with the device-fact reporting and #574's
+    fallback counters, and both were written up in docs/docker.md -- the page a reader opens before
+    pointing a probe at a server was the one page nobody updated. Its sample also printed
+    `"device": "auto"`, which is what `LAYA_DEVICE` defaults to, not a value the handler can return.
+
+    So the key list is read out of `health()`'s `return` rather than typed here, in both directions
+    like the request-body gate above, and the sample is checked for internal coherence too: it is one
+    server's answer, so every per-checkpoint block is keyed by the names in `loaded`, and
+    `device_is_preference` and `device` follow the two rules the handler states.
+    """
+    health, returned = _health_return_keys()
+    assert returned, "health() returns no literal keys; retarget this"
+
+    page = open(os.path.join(ROOT, "docs", "http-api.md"), encoding="utf-8").read()
+    section = page[page.index("### `GET /health`"):page.index("### `POST")]
+    sample = json.loads(section.split("```json", 1)[1].split("```", 1)[0])
+
+    assert sorted(sample) == sorted(returned), "the sample says %s, health() returns %s" % (
+        sorted(sample), sorted(returned))
+    for key in returned:
+        assert "\n- `%s` " % key in section, (
+            "%s is in the sample with no bullet defining it, so the field is listed and not "
+            "explained" % key)
+
+    # The per-checkpoint blocks all key on the same resident checkpoints. A fourth dict-valued key
+    # means the handler grew one and this list has to grow with it, deliberately.
+    resident = set(sample["loaded"])
+    assert resident, "the sample shows no resident checkpoint, so the blocks below prove nothing"
+    blocks = [k for k, v in sample.items() if isinstance(v, dict) and v]
+    assert len(blocks) == 3, "dict-valued blocks are %s; retarget this if the payload grew" % blocks
+    for block in blocks:
+        assert set(sample[block]) == resident, "%s is keyed %r, loaded says %r" % (
+            block, sorted(sample[block]), sorted(resident))
+
+    # `device` is a device label, not the configuration word: the labels come from the only function
+    # that can produce one when nothing is resident.
+    dev_path = os.path.join(ROOT, "laya", "mcp", "device.py")
+    with open(dev_path, encoding="utf-8") as handle:
+        dev_tree = ast.parse(handle.read(), filename=dev_path)
+    labels = set()
+    for node in ast.walk(dev_tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "resolve_device":
+            labels = {stmt.value.value for stmt in ast.walk(node)
+                      if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Constant)
+                      and isinstance(stmt.value.value, str)}
+    assert labels, "resolve_device() returns no literal device label; retarget this"
+    assert sample["device"] in labels, "%r is not a device label resolve_device can return (%s)" % (
+        sample["device"], sorted(labels))
+
+    # The handler's two rules about those fields: the preference flag is true exactly while nothing
+    # is resident, and the top-level answer is the first resident checkpoint's own device.
+    assert sample["device_is_preference"] == (not sample["checkpoint_devices"]), (
+        "device_is_preference says %r with checkpoint_devices %r" % (
+            sample["device_is_preference"], sample["checkpoint_devices"]))
+    if sample["checkpoint_devices"]:
+        assert sample["device"] == sample["checkpoint_devices"][sample["loaded"][0]], (
+            "device must be the first resident checkpoint's device, as serve.py computes it")
+
+    # And the shape of a fallback entry, which no page has ever spelled out: read from the dict the
+    # handler builds per checkpoint.
+    counters = None
+    for node in ast.walk(health):
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Subscript) \
+                and isinstance(node.value, ast.Dict):
+            counters = [k.value for k in node.value.keys if isinstance(k, ast.Constant)]
+    assert counters, "health() builds no per-checkpoint dict literal; retarget this"
+    for name in resident:
+        assert sorted(sample["cpu_fallbacks"][name]) == sorted(counters), (
+            "cpu_fallbacks entries say %s, the handler builds %s" % (
+                sorted(sample["cpu_fallbacks"][name]), sorted(counters)))
+
+
+def test_security_page_health_sample_matches_handler_shape():
+    """docs/security.md's `/health` snippet has to be what the handler really answers.
+
+    #811 pinned docs/http-api.md to `health()`'s own `return` dict. The same payload was
+    quoted on docs/security.md as a four-key line ending in `"device":"auto"`; the handler
+    returns seven keys, and `"auto"` is what `LAYA_DEVICE` defaults to, not a value the
+    handler emits (see the docstring on `test_http_api_page_documents_exactly_the_health_fields`).
+    A reader following that snippet's shape -- to check an SDK, a shell probe, or the shape
+    their own healthcheck parses -- would find their code silently ignores three fields.
+
+    The page's purpose here is to show the checkpoint revision, not the whole payload, so the
+    fix is a `jq` filter rather than a longer literal. The gate accepts either: a filtered
+    curl line, or a raw sample that carries exactly the seven keys the handler returns.
+    """
+    health, returned = _health_return_keys()
+    assert returned, "health() returns no literal keys; retarget this"
+
+    page = open(os.path.join(ROOT, "docs", "security.md"), encoding="utf-8").read()
+
+    # The pre-fix wording, banned verbatim.
+    assert '"status":"ok","loaded":["english"],"revisions":{"english":"55cf4c4e…"},' \
+           '"device":"auto"' not in page, (
+        "docs/security.md restored the pre-fix 4-key /health sample; either filter the "
+        "curl line as the fix does, or list every key health() returns")
+
+    # Find the ```bash code block that runs curl against /health.
+    blocks = re.findall(r"```bash\n(.*?)\n```", page, re.DOTALL)
+    health_blocks = [b for b in blocks if "curl -s localhost:8000/health" in b]
+    assert len(health_blocks) == 1, (
+        "expected exactly one /health curl snippet on docs/security.md, found %d"
+        % len(health_blocks))
+    block = health_blocks[0]
+
+    # Either the curl is filtered (the current fix), or the raw sample enumerates the
+    # handler's keys. A comment-only line without either is a stale quote.
+    filtered = "| jq" in block or "| python" in block or "| grep" in block
+    if filtered:
+        assert re.search(r"#\s*\{", block), (
+            "docs/security.md filters /health with a pipe but shows no example of the "
+            "filtered shape; the block is not useful to a reader")
+    else:
+        # No filter: the raw sample must contain every key health() returns.
+        sample_line = next((ln for ln in block.splitlines() if ln.strip().startswith("#")), "")
+        payload = json.loads(sample_line.lstrip("# ").strip())
+        assert sorted(payload) == sorted(returned), (
+            "docs/security.md's unfiltered /health sample says %s, health() returns %s"
+            % (sorted(payload), sorted(returned)))
+
+
+def _decision_response_site(rel):
+    """What one Agent builds the decision response out of, read from its own literals.
+
+    Returns the result dict's keys, the keys its `usage` block always carries, the keys it adds to
+    `usage` only under a condition, and the `model` constant it stamps. Read out of the source rather
+    than transcribed, because the point of this gate is that the page and both agents describe the
+    same payload; a hand-copied list would be a third copy to keep in step.
+    """
+    path = os.path.join(ROOT, rel)
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=path)
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        keys = usage = head = None
+        optional = set()
+        for stmt in ast.walk(fn):
+            if not isinstance(stmt, ast.Assign) or not stmt.targets:
+                continue
+            first = stmt.targets[0]
+            names = ([k.value for k in stmt.value.keys
+                      if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+                     if isinstance(stmt.value, ast.Dict) else [])
+            if isinstance(first, ast.Name) and first.id == "usage" and "state_tokens" in names:
+                usage = names
+            elif isinstance(first, ast.Subscript) and isinstance(first.value, ast.Name):
+                if first.value.id == "usage" and isinstance(first.slice, ast.Constant):
+                    optional.add(first.slice.value)
+                elif first.value.id == "window_results" and {"answers", "model", "usage"} <= set(names):
+                    keys = names
+                    head = next((v.value for k, v in zip(stmt.value.keys, stmt.value.values)
+                                 if isinstance(k, ast.Constant) and k.value == "model"
+                                 and isinstance(v, ast.Constant)), None)
+        if usage:
+            assert keys, "%s: %s builds a usage block in no result dict literal" % (rel, fn.name)
+            assert head, "%s: %s's result dict has no literal `model` constant" % (rel, fn.name)
+            return {"keys": sorted(keys), "usage": sorted(usage),
+                    "optional": sorted(optional), "head": head}
+    raise AssertionError("%s: no `usage = {...}` literal with a `state_tokens` key" % rel)
+
+
+def _route_decision_keys():
+    """Every keyword some `RouteDecision(...)` is built with, across all of `_route`'s branches."""
+    path = os.path.join(ROOT, "laya", "router.py")
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=path)
+    keys = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "RouteDecision":
+            keys.update(kw.arg for kw in node.keywords if kw.arg)
+    assert keys, "no RouteDecision(...) call with keywords in laya/router.py; retarget this"
+    return sorted(keys)
+
+
+def _md_table_keys(page, header):
+    """The first column of a markdown table, read as rows rather than searched for substrings."""
+    lines = page.splitlines()
+    start = lines.index(header)
+    rows = []
+    for line in lines[start + 2:]:
+        if not line.strip():
+            break
+        rows.append(line.split("|")[1].strip().strip("`"))
+    return rows
+
+
+def test_http_api_page_documents_the_decision_response_keys():
+    r"""The page documents two of the six `usage` keys the agents actually send.
+
+    `### Response` showed `"usage": {"input_tokens": 74, "output_tokens": 0}`, while
+    `Agent.predict_batch` builds six keys and `OnnxAgent._infer_batch` builds the same six -- the
+    truncation report #174 asked for, and the only place a caller can see that the state it sent was
+    cut before the model read it. It showed three of the four `routing` keys (`workflow` is on every
+    branch of `_route`) and four of the eight `laya.lang.analyse()` returns. And it named a
+    `lang_guess` key of `routing` that no code path has ever set: `lang_guess` is a *request* control
+    (`BODY_CONTROLS`), and the evidence a hint acted on is spelled out in `reason`.
+
+    ```
+    usage   documented 2  <-  agent 6 always + options when options collapse, onnx the same
+    routing documented 4  <-  RouteDecision 5: model, repo, reason, detection, workflow
+    detection documented 4  <-  analyse() 8
+    lang_guess   documented 1  <-  set by 0 branches
+    ```
+
+    So every key set below is read out of the source -- the result and usage literals, the
+    `RouteDecision(...)` keywords, `analyse()` at runtime, which needs no checkpoint -- and held to
+    the page in both directions, as the request-body and `/health` gates above do. The sample is the
+    response to the request the page itself prints, so the coherence checks at the end can read it as
+    one server's answer rather than as six unrelated numbers.
+    """
+    from laya.lang import analyse
+
+    page = open(os.path.join(ROOT, "docs", "http-api.md"), encoding="utf-8").read()
+    section = page[page.index("### Response"):page.index("### Confidence")]
+    sample = json.loads(section.split("```json", 1)[1].split("```", 1)[0])
+
+    torch_site = _decision_response_site(os.path.join("laya", "agent.py"))
+    onnx_site = _decision_response_site(os.path.join("laya", "onnx_agent.py"))
+    top, always, optional = torch_site["keys"], torch_site["usage"], torch_site["optional"]
+    assert {k: v for k, v in onnx_site.items() if k != "head"} == \
+        {k: v for k, v in torch_site.items() if k != "head"}, (
+        "the two agents report different fields, so the page cannot describe both: torch %s, "
+        "onnx %s" % (torch_site, onnx_site))
+
+    assert sorted(sample) == sorted(top + ["routing"]), (
+        "the sample says %s, an agent result is %s plus the `routing` Router.attach" % (
+            sorted(sample), top))
+    assert sample["model"] == torch_site["head"], (
+        "the sample's head name is %r, `Agent.predict_batch` stamps %r" % (
+            sample["model"], torch_site["head"]))
+
+    assert sorted(sample["usage"]) == always, (
+        "the sample's usage block says %s, the agents build %s" % (sorted(sample["usage"]), always))
+    documented = _md_table_keys(section, "| `usage` key | meaning |")
+    assert sorted(documented) == sorted(always + optional), (
+        "the usage table says %s, the agents build %s (always) + %s (only when it has to say so)"
+        % (sorted(documented), always, optional))
+
+    routing = _route_decision_keys()
+    assert sorted(sample["routing"]) == routing, (
+        "the sample's routing block says %s, `_route` builds %s" % (sorted(sample["routing"]),
+                                                                   routing))
+    assert sorted(_md_table_keys(section, "| `routing` key | meaning |")) == routing, (
+        "the routing table must name exactly the keys a RouteDecision can carry")
+
+    # The hint the page used to describe as a key is not one, and no branch has ever set it.
+    assert "lang_guess" not in routing + always + optional, (
+        "`lang_guess` is now a response key; the prose describes it as request-side evidence")
+    assert "`lang_guess` evidence" not in page, "the page still calls lang_guess a routing key"
+
+    # `detection` is whatever analyse() returns, so the field names come from calls rather than a
+    # list -- over enough states to show the set does not move with the script, which is what lets
+    # one row describe it.
+    shapes = {tuple(sorted(analyse(state))) for state in
+              ("I was charged twice this month, I want my money back",
+               "Rechnung \u00fcber zwei Abbuchungen, ich bitte um Erstattung",
+               "\u3042\u306e\u8acb\u6c4f\u304c\u91cd\u8907\u3057\u3066\u3044\u307e\u3059", "")}
+    assert len(shapes) == 1, "analyse() returns a different key set per script: %s" % (sorted(shapes),)
+    detected = sorted(shapes.pop())
+    assert sorted(sample["routing"]["detection"]) == detected, (
+        "the sample shows %s, analyse() returns %s" % (
+            sorted(sample["routing"]["detection"]), detected))
+    detection_row = [line for line in section.splitlines() if line.startswith("| `detection` |")]
+    assert len(detection_row) == 1, "the routing table has no single `detection` row"
+    for key in detected:
+        assert "`%s`" % key in detection_row[0], (
+            "%s is in the sample's detection block but not named in the row that defines it" % key)
+
+    # And the sample has to be internally coherent, since it is presented as one real answer: the
+    # truncation flag is that worst case being non-zero, and the per-question list is empty when
+    # nothing was cut.
+    usage = sample["usage"]
+    assert usage["output_tokens"] == 0, "the head generates nothing, so a sample must not show more"
+    assert usage["truncated"] == (usage["state_tokens_dropped"] > 0), usage
+    assert (usage["truncated_questions"] == []) == (not usage["truncated"]), usage
+    assert 0 < usage["state_tokens"] and usage["state_tokens_dropped"] < usage["state_tokens"], usage
+
+
+def _answer_literal_keys(rel):
+    """What one agent stamps on each answer, read out of its own dict literals.
+
+    The three `answers[qid] = {...}` literals of the decode step, keyed by the `"type"` each one
+    writes. From the source rather than transcribed, for the same reason as `_decision_response_site`:
+    a hand-copied list would be a third copy of the contract to keep in step.
+    """
+    path = os.path.join(ROOT, rel)
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=path)
+    found = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not node.targets:
+            continue
+        target = node.targets[0]
+        if not (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+                and target.value.id == "answers" and isinstance(node.value, ast.Dict)):
+            continue
+        names = [k.value for k in node.value.keys
+                 if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+        stamp = next((v.value for k, v in zip(node.value.keys, node.value.values)
+                      if isinstance(k, ast.Constant) and k.value == "type" and isinstance(v, ast.Constant)),
+                     None)
+        if stamp in ("choice", "score", "noul"):
+            found.setdefault(stamp, set()).update(names)
+    assert set(found) == {"choice", "score", "noul"}, "%s builds no answer literal for %s" % (
+        rel, sorted({"choice", "score", "noul"} - set(found)))
+    return {qtype: sorted(keys) for qtype, keys in found.items()}
+
+
+def _gate_written_keys():
+    """Every key the abstention gate writes onto an answer, from `laya/confidence.py` itself."""
+    path = os.path.join(ROOT, "laya", "confidence.py")
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=path)
+    written = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not node.targets:
+            continue
+        target = node.targets[0]
+        if (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+                and target.value.id == "a" and isinstance(target.slice, ast.Constant)):
+            written.add(target.slice.value)
+    return sorted(written)
+
+
+def _serve_added_keys():
+    """Every key the server adds onto an answer the agent built, by answer type (#302).
+
+    Read off the server's own `_add_jev_confidence` run on one answer of each type, rather than
+    transcribed, so a key it starts or stops adding moves this list with it.
+    """
+    probe = {"choice": {"type": "choice", "probabilities": {"a": 0.6, "b": 0.4}},
+             "score": {"type": "score", "probabilities": {"0": 0.6, "1": 0.4}},
+             "noul": {"type": "noul", "noul": 0.6}}
+    served = _add_jev_confidence({"answers": probe})["answers"]
+    return {qtype: sorted(set(served[qtype]) - set(probe[qtype])) for qtype in probe}
+
+
+def _md_answer_table(section):
+    """The `| answer type | keys |` table as rows: which keys the page says an answer carries.
+
+    Only backticks name keys, and only a lowercase identifier among them: prose in a cell is
+    description, and `"0".. "k-1"` names the shape of `probabilities` rather than a field. A dotted
+    name is one key reached through another -- `action.act_probability` is the `action` dict -- so it
+    counts as its head.
+    """
+    lines = section.splitlines()
+    start = lines.index("| answer type | keys |")
+    rows = {}
+    for line in lines[start + 2:]:
+        if not line.strip():
+            break
+        cells = line.split("|")
+        names = set()
+        for token in cells[2].split("`")[1::2]:
+            head = token.split(".")[0]
+            if head.isidentifier() and head == head.lower():
+                names.add(head)
+        rows[cells[1].strip().strip("`")] = names
+    assert set(rows) == {"choice", "score", "noul", "all", "gate"}, (
+        "the answer table rows are %s; this gate reads one row per question type, one for the keys "
+        "every answer shares, and one for the gate report" % sorted(rows))
+    return rows
+
+
+def test_http_api_page_documents_the_gate_report_on_an_answer():
+    r"""The page documents every key an answer can carry, including the three the gate adds (#361).
+
+    `### Response` describes the answer key set in a table and the request controls in another, and the
+    usage and routing tables of the same page are already held to the code in both directions. The
+    answer table was the one left out, and it had drifted in the way only a table nobody checks drifts:
+    it named the three keys an agent builds and the three `apply_confidence_gate` writes onto the very
+    same answers in none of them. A caller could set `min_confidence` from the request table and then
+    read a response page that said the answer had been "marked" without saying what the mark is called,
+    what state the answer is in, or what threshold produced it.
+
+    So the table is compared against every writer: the `answers[qid] = {...}` literals of each agent,
+    the `a[...] = ...` assignments of the gate, and the keys the server adds (#302). Both directions,
+    and against the printed sample too -- which must carry no gate report, because the request the
+    page prints sets no threshold.
+    """
+    page = open(os.path.join(ROOT, "docs", "http-api.md"), encoding="utf-8").read()
+    section = page[page.index("### Response"):page.index("### Confidence")]
+    rows = _md_answer_table(section)
+
+    torch_site = _answer_literal_keys(os.path.join("laya", "agent.py"))
+    onnx_site = _answer_literal_keys(os.path.join("laya", "onnx_agent.py"))
+    assert torch_site == onnx_site, (
+        "the two agents build different answers, so the page cannot describe both: torch %s, onnx %s"
+        % (torch_site, onnx_site))
+
+    gate = _gate_written_keys()
+    assert gate, "the gate writes no `a[...] = ...` in laya/confidence.py; retarget this"
+    assert sorted(rows["gate"]) == gate, (
+        "the gate report says %s, `apply_confidence_gate` and `flag_low_confidence` write %s"
+        % (sorted(rows["gate"]), gate))
+
+    # The row's first column is the discriminator every answer stamps, so it is documented by the row
+    # that documents the type rather than as a key inside the cell.
+    discriminator = {"type"}
+    served = _serve_added_keys()
+    for qtype, built in torch_site.items():
+        documented = rows[qtype] | rows["all"] | rows["gate"] | discriminator
+        assert documented == set(built) | set(gate) | set(served[qtype]), (
+            "the %s rows say an answer carries %s, the agents build %s, the gate adds %s and the "
+            "server adds %s" % (qtype, sorted(documented), built, gate, served[qtype]))
+
+    # And the sample is one answer to the request the page itself prints, which sends no threshold:
+    # so its answers show the always-on keys and no gate report at all.
+    curl = page[page.index("### `POST /v1/systemone`"):page.index("### Response")]
+    assert "min_confidence" not in curl.split("```bash", 1)[1].split("```", 1)[0], (
+        "the printed request now sets a threshold, so the sample below it has to show the gate report")
+    sample = json.loads(section.split("```json", 1)[1].split("```", 1)[0])
+    assert sample["answers"], "the printed sample carries no answers"
+    for qid, answer in sample["answers"].items():
+        assert not set(gate) & set(answer), (
+            "%s is ungated in the printed request but carries the gate key %s" % (
+                qid, sorted(set(gate) & set(answer))))
+        assert set(answer) == discriminator | rows[answer["type"]] | rows["all"], (
+            "the sample's %s answer says %s, its table row plus the shared row say %s" % (
+                qid, sorted(answer), sorted(discriminator | rows[answer["type"]] | rows["all"])))
+
+
+class IdleRouter(FakeRouter):
+    def __init__(self):
+        import threading
+        super().__init__()
+        self.loaded = ["english"]
+        self.unloaded = threading.Event()
+        self.unload_threads = []
+
+    def unload(self):
+        import threading
+        self.unload_threads.append(threading.current_thread().name)
+        self.loaded = []
+        self.unloaded.set()
+
+    def predict(self, *args, **kwargs):
+        self.loaded = ["english"]
+        return super().predict(*args, **kwargs)
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, 0.0), ("", 0.0), ("  ", 0.0), ("0", 0.0), ("-5", 0.0), ("abc", 0.0),
+    ("nan", 0.0), ("inf", 0.0), ("-inf", 0.0), ("1e999", 0.0),
+    ("300", 300.0), (" 0.5 ", 0.5), ("1e2", 100.0),
+])
+def test_idle_unload_setting_is_finite_and_opt_in(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("LAYA_IDLE_UNLOAD_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", raw)
+    assert _resolve_idle_unload_seconds() == expected
+
+
+def test_idle_unload_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("LAYA_IDLE_UNLOAD_SECONDS", raising=False)
+    router = IdleRouter()
+    with TestClient(create_app(router)) as client:
+        assert not router.unloaded.wait(0.15)
+        assert router.loaded == ["english"]
+        assert "idle_seconds" not in client.get("/health").json()
+
+
+def test_idle_unload_reloads_on_the_next_request(monkeypatch):
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "0.1")
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    router = IdleRouter()
+    with TestClient(create_app(router)) as client:
+        first = client.post("/v1/systemone", json=REQ).json()
+        assert router.unloaded.wait(2.0)
+        health = client.get("/health").json()
+        assert health["loaded"] == [] and health["idle_unload_seconds"] == 0.1
+        assert health["idle_seconds"] >= 0.1
+        assert client.post("/v1/systemone", json=REQ).json() == first
+        assert router.loaded == ["english"]
+    assert all(name.startswith("laya-infer") for name in router.unload_threads)
+
+
+def test_idle_details_stay_authenticated(monkeypatch):
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "300")
+    monkeypatch.setenv("LAYA_API_KEY", "key")
+    with TestClient(create_app(IdleRouter())) as client:
+        assert client.get("/health").json() == {"status": "ok"}
+        assert client.get("/health", headers={"Authorization": "Bearer key"}).json()["idle_unload_seconds"] == 300
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_idle_window_starts_after_worker_finishes_even_on_cancel_or_failure(monkeypatch, batch, cancel, fail):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "0.2")
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+
+    class BlockingRouter(IdleRouter):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.finished = threading.Event()
+            self.active = False
+
+        def predict(self, *args, **kwargs):
+            self.active = True
+            self.started.set()
+            try:
+                assert self.release.wait(3.0)
+                if fail:
+                    raise ValueError("test failure")
+                return super().predict(*args, **kwargs)
+            finally:
+                self.active = False
+                self.finished.set()
+
+        def unload(self):
+            assert not self.active, "unload overlapped inference"
+            super().unload()
+
+    router = BlockingRouter()
+    path = "/v1/systemone/batch" if batch else "/v1/systemone"
+    body = {"states": [REQ["state"]], "questions": REQ["questions"]} if batch else REQ
+    app = create_app(router)
+    if cancel:
+        import httpx
+
+        async def exercise():
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+                    task = asyncio.create_task(client.post(path, json=body))
+                    try:
+                        assert await asyncio.to_thread(router.started.wait, 2.0)
+                        task.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await task
+                        # A reaper can now queue behind the still-running forward pass.
+                        await asyncio.sleep(0.3)
+                        assert not router.unloaded.is_set()
+                        router.release.set()
+                        assert await asyncio.to_thread(router.finished.wait, 2.0)
+                        assert not await asyncio.to_thread(router.unloaded.wait, 0.1)
+                        assert await asyncio.to_thread(router.unloaded.wait, 2.0)
+                    finally:
+                        router.release.set()
+        asyncio.run(exercise())
+    else:
+        with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as callers:
+            request = callers.submit(client.post, path, json=body)
+            try:
+                assert router.started.wait(2.0)
+                time.sleep(0.3)
+                assert not router.unloaded.is_set()
+                router.release.set()
+                assert request.result(timeout=2.0).status_code == (422 if fail else 200)
+                assert not router.unloaded.wait(0.1)
+                assert router.unloaded.wait(2.0)
+            finally:
+                router.release.set()
+
+
+def test_idle_unload_retries_failure_and_stops_at_shutdown(monkeypatch):
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "0.05")
+
+    class RetryRouter(IdleRouter):
+        attempts = 0
+
+        def unload(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("test unload failure")
+            super().unload()
+
+    router = RetryRouter()
+    with TestClient(create_app(router)):
+        assert router.unloaded.wait(2.0)
+    assert router.attempts == 2
+    router.loaded = ["english"]
+    router.unloaded.clear()
+    assert not router.unloaded.wait(0.15)
+
+
+# -------------------------------- an app can be started again after its lifespan stops
+# The lifespan shuts the inference pool down (#319), and a host can run one app's lifespan more
+# than once: a TestClient per test module, an embedding server that restarts it. The pool was made
+# once in create_app, so after a second startup every request was a 500 "inference failed" from
+# "cannot schedule new futures after shutdown", and the idle reaper logged the same each tick.
+@pytest.mark.parametrize("batch", [False, True])
+def test_an_app_serves_again_after_its_lifespan_restarts(monkeypatch, batch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    monkeypatch.delenv("LAYA_IDLE_UNLOAD_SECONDS", raising=False)
+    app = create_app(FakeRouter())
+    path = "/v1/systemone/batch" if batch else "/v1/systemone"
+    body = {"states": [REQ["state"]], "questions": REQ["questions"]} if batch else REQ
+    statuses = []
+    for _ in range(2):
+        with TestClient(app) as client:
+            statuses.append(client.post(path, json=body).status_code)
+    assert statuses == [200, 200]
+
+
+def test_idle_unload_runs_again_after_a_restart(monkeypatch):
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "0.05")
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    router = IdleRouter()
+    app = create_app(router)
+    with TestClient(app):
+        assert router.unloaded.wait(2.0)
+    router.loaded = ["english"]
+    router.unloaded.clear()
+    with TestClient(app):
+        assert router.unloaded.wait(2.0)
+
+
+def test_a_restarted_app_still_queues_concurrent_requests(monkeypatch):
+    # The inference gate binds to the event loop the first time a request has to wait on it, and
+    # a restarted lifespan runs on a new loop. A gate carried over from the first run made the
+    # second run's queued request fail with "is bound to a different event loop".
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    monkeypatch.delenv("LAYA_IDLE_UNLOAD_SECONDS", raising=False)
+
+    class SlowRouter(FakeRouter):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def predict(self, *args, **kwargs):
+            self.entered.set()
+            assert self.release.wait(3.0)
+            return super().predict(*args, **kwargs)
+
+    router = SlowRouter()
+    app = create_app(router)
+    for _ in range(2):
+        router.entered.clear()
+        router.release.clear()
+        with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as callers:
+            first = callers.submit(client.post, "/v1/systemone", json=REQ)
+            assert router.entered.wait(2.0)
+            second = callers.submit(client.post, "/v1/systemone", json=REQ)
+            time.sleep(0.2)  # the second request is now waiting on the gate
+            router.release.set()
+            assert [first.result(timeout=5).status_code, second.result(timeout=5).status_code] == [200, 200]
+
+
+# -------------------------------- docs/typescript-sdk.md must list the keys the /health handler returns
+# The SDK page's contract sentence used to say "public `/health` returns `status`, `loaded`,
+# and `device`" while `laya/serve.py`'s authorized branch returns seven keys -- `status`,
+# `loaded`, `revisions`, `device`, `device_is_preference`, `checkpoint_devices`, and
+# `cpu_fallbacks` -- and the unauthenticated branch returns only `LIVENESS_ONLY = {"status":
+# "ok"}`. Two docs (#811 gated `docs/http-api.md`, and README:103 advertises the CPU-fallback
+# reporting) describe the full shape, so the SDK page contradicted them. The gate AST-parses the
+# handler's returns so the doc's key set has to match the code's -- any new /health field added
+# to the return dict must be named on this page too, or the test fails with the exact mismatch.
+# Reading only the return dict's own keys left one kind of field out: `**idle` spreads a local
+# conditional dict, so `idle_unload_seconds` and `idle_seconds` were invisible to the gate and the
+# page under-reported the shape by two fields on a deployment that sets
+# `LAYA_IDLE_UNLOAD_SECONDS`. `test_idle_details_stay_authenticated` and
+# `test_idle_unload_reloads_on_the_next_request` read both of them off a live handler, so the gate
+# now resolves a starred spread to the local dict it unpacks.
+TS_SDK_PAGE = os.path.join(ROOT, "docs", "typescript-sdk.md")
+TS_SDK_OLD_CLAIM = (
+    "Laya's public `/health` returns `status`, `loaded`, and `device`. "
+    "Prediction never probes health first."
+)
+
+
+def _literal_dict_keys(value):
+    """Keys of a dict literal, looking through `({...} if condition else {})`."""
+    if isinstance(value, ast.Dict):
+        return {key.value for key in value.keys if isinstance(key, ast.Constant)}
+    if isinstance(value, ast.IfExp):
+        return _literal_dict_keys(value.body) | _literal_dict_keys(value.orelse)
+    return set()
+
+
+def _serve_health_return_keys():
+    """Every dict key the `health` handler returns across all branches.
+
+    `LIVENESS_ONLY` is a module-level dict, so the `return LIVENESS_ONLY` branch resolves via
+    the module scope; the authorized `return {...}` branch contributes its own keys directly, and
+    a `**name` spread contributes the keys of the dict `name` was assigned -- that is how the two
+    conditional idle fields reach the response, and reading the return dict's own keys missed them.
+    """
+    with open(os.path.join(ROOT, "laya", "serve.py"), encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename="laya/serve.py")
+    module_dicts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    module_dicts[target.id] = _literal_dict_keys(node.value)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "health":
+            local_dicts = {}
+            for assign in ast.walk(node):
+                if isinstance(assign, ast.Assign):
+                    for target in assign.targets:
+                        if isinstance(target, ast.Name):
+                            local_dicts[target.id] = _literal_dict_keys(assign.value)
+            keys = set()
+            for ret in ast.walk(node):
+                if not isinstance(ret, ast.Return) or ret.value is None:
+                    continue
+                value = ret.value
+                if isinstance(value, ast.Dict):
+                    for key, spread in zip(value.keys, value.values):
+                        if isinstance(key, ast.Constant):
+                            keys.add(key.value)
+                        elif key is None and isinstance(spread, ast.Name):
+                            keys.update(local_dicts.get(spread.id, ()))
+                            keys.update(module_dicts.get(spread.id, ()))
+                elif isinstance(value, ast.Name):
+                    keys.update(local_dicts.get(value.id, ()))
+                    keys.update(module_dicts.get(value.id, ()))
+            return keys
+    raise AssertionError("no `health` handler found in laya/serve.py -- gate is checking a moved symbol")
+
+
+def _ts_sdk_health_claim_keys():
+    r"""The backticked key names in the sentence that opens 'public `/health` returns'.
+
+    The claim spans several lines on this page, so read from "public \`/health\` returns" up to the
+    sentence-ending "Prediction never probes health first" before collecting backticked names;
+    that stops the scan from picking up later backticked references.
+    """
+    with open(TS_SDK_PAGE, encoding="utf-8") as handle:
+        page = handle.read()
+    start = page.find("public `/health` returns")
+    assert start != -1, "the /health claim was removed from docs/typescript-sdk.md -- gate has nothing to read"
+    tail = page[start:]
+    end = tail.find("Prediction never probes health first")
+    assert end != -1, "the /health claim's tail sentence is gone -- the gate cannot bound its scan"
+    sentence = tail[:end]
+    names = set(re.findall(r"`([A-Za-z_][A-Za-z_0-9]*)`", sentence)) - {"health"}
+    # The sentence names the two settings that decide which fields appear. A response key of this
+    # payload is never spelled in upper case, so an ALL-CAPS backtick is an environment variable and
+    # not a field the caller reads off the body.
+    return {name for name in names if not name.isupper()}
+
+
+def test_ts_sdk_health_claim_matches_the_handler():
+    """The SDK page must name exactly the keys `laya/serve.py`'s `health` handler returns."""
+    assert "returns `status`, `loaded`, and `device`" in TS_SDK_OLD_CLAIM, (
+        "the pre-fix literal must itself carry the wrong key set, otherwise this ban is vacuous")
+    # Sanity-check the AST extraction: the shipped code returns seven keys on the authorized branch
+    # and spreads two more when idle unloading is on, so a future PR that reshapes /health without
+    # updating this page fails below.
+    handler_keys = _serve_health_return_keys()
+    assert "status" in handler_keys, "the LIVENESS_ONLY short-circuit disappeared; the AST reader missed it"
+    for key in ("loaded", "revisions", "device", "device_is_preference",
+                "checkpoint_devices", "cpu_fallbacks"):
+        assert key in handler_keys, "%s is not in the /health handler's return set -- did the " \
+                                    "shape change without this test being updated?" % key
+    assert {"idle_unload_seconds", "idle_seconds"} <= handler_keys, (
+        "`health` no longer spreads a conditional dict into its return, or the spread is now a shape "
+        "this reader cannot resolve. The handler answers nine keys on a deployment with "
+        "LAYA_IDLE_UNLOAD_SECONDS set and docs/typescript-sdk.md names all nine; re-read the "
+        "handler before re-pinning either side.")
+    documented = _ts_sdk_health_claim_keys()
+    assert documented == handler_keys, (
+        "docs/typescript-sdk.md's /health sentence names %s, but `laya/serve.py`'s `health` "
+        "handler returns %s. Any drift here misleads a caller who reads only the SDK page." % (
+            sorted(documented), sorted(handler_keys)))
+
+
+def test_ts_sdk_health_claim_drops_the_three_key_version():
+    """Ban the pre-fix wording directly so a plain revert fails with an explicit message.
+
+    Independent of the set-equality test above; a numeric or word change in the handler still
+    trips the AST path, but a straight "put the sentence back the way it was" fails here with
+    a pointer to the actual shape.
+    """
+    with open(TS_SDK_PAGE, encoding="utf-8") as handle:
+        page = handle.read()
+    banned = "returns `status`, `loaded`, and `device`"
+    assert banned not in page, (
+        "docs/typescript-sdk.md again says `/health` returns only `status`, `loaded`, and "
+        "`device`. `laya/serve.py`'s authorized branch has seven keys and the unauthenticated "
+        "branch has one; if either shape has since changed, update this ban's literal too.")
+
+
+# `re` is not imported at the top of this file; import here so the helper above can use it
+# without changing the module's existing import order.
+import re  # noqa: E402
+def test_jev_strict_projection_page_names_the_projected_keys():
+    """docs/http-api.md's four strict bullets must be the key sets `_project_jev_strict` returns.
+
+    The page is the second copy of the contract, after the handler's docstring. Both used to
+    claim ``noul = `noul` only``, but the projection emits ``{"type": "noul", "noul": ...}``,
+    and the pre-existing ``test_jev_strict_projects_the_full_payload`` asserts that two-key
+    shape verbatim -- so the prose and the pinned test disagreed, and a client that validated
+    the "no fields other than `noul`" sentence rejected every strict noul answer the flag
+    exists to sanitize.
+
+    The gate calls the real projection on a fixture that carries all three answer types plus
+    the additions a strict client must not see, then reads the four bullet lines from
+    `docs/http-api.md` and asserts each bullet's backticked key set equals the corresponding
+    projected key set. The pre-fix wording is banned as a direct substring so the gate fails
+    if the page reverts.
+    """
+    import re
+    from pathlib import Path
+
+    from laya.serve import _project_jev_strict
+
+    fixture = {
+        "model": "laya-rl-agent",
+        "answers": {
+            "queue": {"type": "choice", "choice": "billing",
+                      "probabilities": {"billing": 0.95, "tech": 0.05},
+                      "confidence": 0.80, "action": "answer",
+                      "answer_confidence": 0.75},
+            "urgency": {"type": "score", "score": 1.70, "confidence": 0.19,
+                        "probabilities": {"0": 0.02, "1": 0.65, "2": 0.33},
+                        "legend": {"0": "calm", "1": "firm", "2": "angry"},
+                        "action": "answer"},
+            "threat": {"type": "noul", "noul": 0.9148, "confidence": 0.85,
+                       "answer_confidence": 0.70, "action": "answer"},
+        },
+        "usage": {"input_tokens": 83, "output_tokens": 0,
+                  "windows": 1, "collapsed_options": 0},
+        "routing": {"model": "typed-decisions", "reason": "typed workflow"},
+    }
+    projected = _project_jev_strict(fixture)
+
+    page = (Path(__file__).resolve().parents[1] / "docs" / "http-api.md").read_text(encoding="utf-8")
+
+    def bullet_keys(label):
+        for line in page.splitlines():
+            if line.startswith("- a `%s` answer keeps" % label):
+                back = line.split("keeps", 1)[1]
+                return set(re.findall(r"`([A-Za-z_][A-Za-z_0-9]*)`", back))
+        raise AssertionError("bullet for %r not found" % label)
+
+    assert set(projected["answers"]["queue"]) == bullet_keys("choice"), \
+        "doc says %r, handler emits %r" % (sorted(bullet_keys("choice")),
+                                            sorted(projected["answers"]["queue"]))
+    assert set(projected["answers"]["urgency"]) == bullet_keys("score")
+    assert set(projected["answers"]["threat"]) == bullet_keys("noul")
+
+    # The noul bullet must not shrink the discriminator away.
+    assert "noul only" not in page, "pre-fix 'noul only' wording is still on the page"
+
+# Serving a fine-tune today means rebuilding the package: `Router` has grown
+# `register` / `models=`, but `laya-serve` reads its whole configuration from the
+# environment, so an operator with a local checkpoint had no way to reach either.
+# LAYA_EXTRA_MODELS is the JSON-object form of `Router(models=...)`, parsed once
+# at startup; the request handlers then resolve `model` against the Router's own
+# registry rather than the built-in table, so a registered name pins its
+# checkpoint the same way `english` does.
+def test_extra_models_option_parses_the_json_object(monkeypatch):
+    from laya.serve import _extra_models_option
+
+    # Unset and blank are "not asked for", like every other option here.
+    monkeypatch.delenv("LAYA_EXTRA_MODELS", raising=False)
+    assert _extra_models_option() == {}
+    for blank in ("", "   ", "\n"):
+        monkeypatch.setenv("LAYA_EXTRA_MODELS", blank)
+        assert _extra_models_option() == {}, repr(blank)
+
+    # The two source shapes Router.register accepts: a plain string (Hub repo id
+    # or local directory) and a [repo, subfolder] pair, which arrives as a tuple
+    # because JSON has no tuple.
+    monkeypatch.setenv("LAYA_EXTRA_MODELS", json.dumps({
+        "my-ckpt": "/tmp/ckpt",
+        "nested": ["org/repo", "folder"],
+        "hub-only": "org/repo",
+    }))
+    parsed = _extra_models_option()
+    assert parsed == {
+        "my-ckpt": "/tmp/ckpt",
+        "nested": ("org/repo", "folder"),
+        "hub-only": "org/repo",
+    }, parsed
+
+
+def test_extra_models_option_refuses_a_malformed_value(monkeypatch):
+    from laya.serve import _extra_models_option
+
+    # The fail-closed rule is `_default_model_option`'s: a checkpoint silently
+    # absent from the registry would auto-route its traffic to a different one,
+    # which is the wrong answer -- so the server refuses to start and the
+    # message names the variable and the offending shape.
+    for raw in ("{", "not json", '"english"', '["english"]', "42", "null"):
+        monkeypatch.setenv("LAYA_EXTRA_MODELS", raw)
+        with pytest.raises(SystemExit) as raised:
+            _extra_models_option()
+        assert "invalid LAYA_EXTRA_MODELS" in str(raised.value), raw
+
+    # A source that is not a string or a pair fails the same way, naming the
+    # checkpoint it was meant to register.
+    monkeypatch.setenv("LAYA_EXTRA_MODELS", json.dumps({"my-ckpt": 7}))
+    with pytest.raises(SystemExit) as raised:
+        _extra_models_option()
+    message = str(raised.value)
+    assert "invalid LAYA_EXTRA_MODELS" in message
+    assert "'my-ckpt'" in message, message
+
+    # A list was believed on its type alone, so `[]` reached the Router and became
+    # `ValueError: not enough values to unpack` on the first request routed to it,
+    # and `["a", "b", "c"]` or `["a", 5]` became the wrong repo id in silence. Same
+    # refusal, same naming, at startup.
+    for bad in ([], ["a", "b", "c"], ["a", 5], [None, None]):
+        monkeypatch.setenv("LAYA_EXTRA_MODELS", json.dumps({"my-ckpt": bad}))
+        with pytest.raises(SystemExit) as raised:
+            _extra_models_option()
+        message = str(raised.value)
+        assert "invalid LAYA_EXTRA_MODELS" in message, (bad, message)
+        assert "'my-ckpt'" in message, (bad, message)
+
+
+def test_extra_models_reach_the_router_the_server_builds(monkeypatch):
+    # Registration happens before preload, so the names resolve on the Router
+    # itself and `registered` reports them beside the bundled checkpoints.
+    router, built = _server_router(monkeypatch, LAYA_EXTRA_MODELS=json.dumps({
+        "my-ckpt": "/tmp/ckpt",
+        "nested": ["org/repo", "folder"],
+    }))
+    assert router.resolve("my-ckpt") == "my-ckpt"
+    assert router.resolve("nested") == "nested"
+    assert router.registered["my-ckpt"]["source"] == "/tmp/ckpt"
+    assert built == []  # registering is lazy: nothing loads until a request names it
+
+    # The built-ins are untouched, and an extra name is accepted as
+    # LAYA_DEFAULT_MODEL now that the Router knows it.
+    assert set(router.registered) == {"my-ckpt", "nested"}
+    defaulted, _ = _server_router(
+        monkeypatch,
+        LAYA_EXTRA_MODELS='{"my-ckpt": "/tmp/ckpt"}',
+        LAYA_DEFAULT_MODEL="my-ckpt",
+    )
+    assert defaulted.default == "my-ckpt"
+
+
+def test_extra_models_refuse_the_names_router_refuses(monkeypatch):
+    # Validation is Router._add's: the env var is only the delivery mechanism,
+    # so a name that cannot be a checkpoint is fatal with core's own message.
+    for name in ("auto", "Bad Name", "not/a/checkpoint"):
+        with pytest.raises(SystemExit) as raised:
+            _server_router(monkeypatch, LAYA_EXTRA_MODELS=json.dumps({name: "/tmp/ckpt"}))
+        assert "checkpoint name" in str(raised.value), name
+
+    # And a default that names nothing registered is still fatal, unchanged.
+    from laya.serve import build_router
+
+    monkeypatch.setenv("LAYA_PRELOAD", "0")
+    monkeypatch.setenv("LAYA_EXTRA_MODELS", '{"my-ckpt": "/tmp/ckpt"}')
+    monkeypatch.setenv("LAYA_DEFAULT_MODEL", "other-ckpt")
+    with pytest.raises(SystemExit) as raised:
+        build_router()
+    assert "invalid LAYA_DEFAULT_MODEL" in str(raised.value)
+
+
+def test_extra_models_pin_over_http_and_do_not_leak_into_routing(monkeypatch):
+    # The end-to-end contract: `model=my-ckpt` reaches `predict` as the pin, a
+    # Jev id still means "let the router choose", and a path is still a 422.
+    router, built = _server_router(monkeypatch, LAYA_EXTRA_MODELS='{"my-ckpt": "/tmp/ckpt"}')
+    client = TestClient(create_app(router=router))
+
+    pinned = client.post("/v1/systemone", json={**REQ, "model": "my-ckpt"})
+    assert pinned.status_code == 200, pinned.text
+    assert built == ["my-ckpt"], built
+    assert pinned.json()["routing"]["model"] == "my-ckpt", pinned.json()
+
+    batch = client.post("/v1/systemone/batch", json={
+        "states": ["one"], "questions": REQ["questions"], "model": "my-ckpt"})
+    assert batch.status_code == 200, batch.text
+
+    unrouted = client.post("/v1/systemone", json={**REQ, "model": "jev-1"})
+    assert unrouted.status_code == 200, unrouted.text
+    assert unrouted.json()["routing"]["model"] in ("english", "multilingual"), unrouted.json()
+
+    refused = client.post("/v1/systemone", json={**REQ, "model": "/path/to/other"})
+    assert refused.status_code == 422, refused.text
+    assert "unknown model" in refused.json()["detail"]
+
+    # A registered name is a pin, not a routing target: the extra checkpoint is
+    # never picked for a state that did not name it.
+    plain = client.post("/v1/systemone", json=REQ)
+    assert plain.status_code == 200, plain.text
+    assert plain.json()["routing"]["model"] in ("english", "multilingual", "typed-decisions")
+    assert "my-ckpt" not in built[1:] or built[1:] == [], built
+
+
+# --------------------------------------------------------------------------- body-read deadline
+#
+# `_admit()` takes a `LAYA_MAX_CONCURRENT` slot BEFORE the body is read, which is what bounds how
+# many bodies are buffered at once. A peer that sends a request head and one partial chunk and then
+# stops writing used to hold that slot for as long as it kept the socket open, so a few idle sockets
+# took both decision routes out of service while `/health` kept reporting the process healthy.
+# `_read_body_capped` now bounds the read, answers 408, and lets the `async with _admit()` unwind.
+
+_ASGI_BODY = json.dumps({
+    "state": "hi",
+    "questions": {"q": {"type": "noul", "instructions": "is it true?"}},
+}).encode()
+
+
+def _asgi_scope(path):
+    return {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.1"},
+            "http_version": "1.1", "method": "POST", "scheme": "http",
+            "path": path, "raw_path": path.encode(), "query_string": b"",
+            "root_path": "", "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 5000), "server": ("127.0.0.1", 8000)}
+
+
+async def _asgi_post(app, path, body, *, stall_after=None, timeout=10.0):
+    """One ASGI POST, returning (status, body). `stall_after` sends that many bytes then hangs."""
+    messages = []
+    state = {"sent": False}
+
+    async def receive():
+        if not state["sent"]:
+            state["sent"] = True
+            if stall_after is None:
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.request", "body": body[:stall_after], "more_body": True}
+        if stall_after is not None:
+            await asyncio.Event().wait()          # the peer never writes another byte
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    await asyncio.wait_for(app(_asgi_scope(path), receive, send), timeout=timeout)
+    status = next(m["status"] for m in messages if m["type"] == "http.response.start")
+    payload = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return status, payload
+
+
+def test_a_stalled_body_answers_408_and_frees_its_admission_slot(monkeypatch):
+    # One slot, so the second request proves the first one gave its slot back rather than merely
+    # that a second request is allowed to take one.
+    monkeypatch.setenv("LAYA_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("LAYA_BODY_READ_TIMEOUT", "0.05")
+    app = create_app(router=FakeRouter())
+
+    async def run():
+        stalled = await _asgi_post(app, "/v1/systemone", _ASGI_BODY, stall_after=10)
+        served = await _asgi_post(app, "/v1/systemone", _ASGI_BODY)
+        return stalled, served
+
+    (stall_status, stall_body), (served_status, _) = asyncio.run(run())
+    assert stall_status == 408, stall_body
+    assert b"not received in time" in stall_body
+    assert served_status == 200, served_status
+
+
+@pytest.mark.parametrize("raw, want", [
+    (None, DEFAULT_BODY_READ_TIMEOUT),
+    ("2.5", 2.5),
+    ("", DEFAULT_BODY_READ_TIMEOUT),
+    ("  ", DEFAULT_BODY_READ_TIMEOUT),
+    ("0", DEFAULT_BODY_READ_TIMEOUT),
+    ("-1", DEFAULT_BODY_READ_TIMEOUT),
+    ("nope", DEFAULT_BODY_READ_TIMEOUT),
+    ("inf", DEFAULT_BODY_READ_TIMEOUT),
+    ("nan", DEFAULT_BODY_READ_TIMEOUT),
+])
+def test_body_read_timeout_resolution(monkeypatch, raw, want):
+    monkeypatch.delenv("LAYA_BODY_READ_TIMEOUT", raising=False)
+    if raw is not None:
+        monkeypatch.setenv("LAYA_BODY_READ_TIMEOUT", raw)
+    assert _resolve_body_read_timeout() == want
+
+
+def test_a_body_delivered_in_time_still_answers(monkeypatch):
+    # The deadline adds no behaviour to the ordinary path: same status, same payload.
+    monkeypatch.setenv("LAYA_BODY_READ_TIMEOUT", "5")
+    app = create_app(router=FakeRouter())
+    status, payload = asyncio.run(_asgi_post(app, "/v1/systemone", _ASGI_BODY))
+    assert status == 200
+    assert json.loads(payload)["usage"]["input_tokens"] == 42

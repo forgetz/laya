@@ -16,9 +16,9 @@ export type {
 export { createNodeProvider, createWebProvider, feed, feedHead, loadNodeBundle, loadWebBundle, PINNED_REVISIONS, resolveRevision } from "./providers.js";
 export type { Batch, SessionProvider, ProviderOptions, NodeBundle, WebBundle } from "./providers.js";
 export { Router, normaliseName, DEFAULT_MODELS, digestsFromEnv, _digestsFromEnv } from "./router.js";
-export type { RoutedResult, RouteDecision, ModelName, ModelSpec, BatchRequest, RouterOptions, RouteOptions } from "./router.js";
-export { shortlistChoice, predictShortlist, embedFnFromAgent, DEFAULT_SHORTLIST_K } from "./shortlist.js";
-export type { EmbedFn, ShortlistMeta } from "./shortlist.js";
+export type { RoutedResult, RouteDecision, ModelName, ModelSpec, BatchRequest, PredictBatchOptions, RouterOptions, RouteOptions } from "./router.js";
+export { shortlistChoice, predictShortlist, predictTournament, embedFnFromAgent, cached, cachedEmbedFn, DEFAULT_SHORTLIST_K, DEFAULT_SHORTLIST_MAXSIZE, DEFAULT_TOURNAMENT_GROUP } from "./shortlist.js";
+export type { EmbedFn, ShortlistMeta, TournamentMeta, CacheInfo, CachedEmbedFn } from "./shortlist.js";
 export { analyse, isEnglish, guessLatinLanguage, detectScript } from "./lang.js";
 export type { AnalyseResult, LatinProfile } from "./lang.js";
 export { cleanEmailBody, emailState } from "./email.js";
@@ -37,9 +37,15 @@ export {
   HOOK_EVENTS,
 } from "./hooks.js";
 export type { Hook, HookEvent, HookArg, PredictHook, PredictHookArg } from "./hooks.js";
+export { OptionStabilityHook, makeVariants, decideReliability, calibrateReliability } from "./option-stability.js";
+export type {
+  OptionStabilityOptions, OptionStabilityReport, StabilityProbe, ReliabilityDecision,
+  StabilityVariant, VariantOptions, CalibrationOptions,
+} from "./option-stability.js";
 export { triageQuestions, emailQuestions, guardQuestions, moderationQuestions, routerQuestions } from "./presets.js";
 export {
   decide,
+  decideBatch,
   planFromJsonSchema,
   questionsFromJsonSchema,
   answersToJson,
@@ -48,25 +54,45 @@ export {
   MAX_OPTIONS,
   MAX_SCORE_LEVELS,
 } from "./structured.js";
-export type { DecisionResult, DecideOptions, DecideRunner, PlannedField } from "./structured.js";
+export type { DecisionResult, DecideOptions, DecideBatchOptions, DecideRunner, PlannedField } from "./structured.js";
 export {
   renderOptions,
   serializeState,
   buildSequence,
   buildQuestionPrefix,
   sequenceWithState,
+  collapsedOptions,
   softmax,
   confidenceFromProbs,
   answerConfidence,
   checkMinConfidence,
+  checkMinConfidenceMap,
   flagLowConfidence,
+  optionBucket,
+  resolveMinConfidence,
   clampTemperature,
   tempBucket,
+  applyBinningMap,
+  checkBinningMap,
   collateItems,
   TEMP_MIN,
   TEMP_MAX,
 } from "./common.js";
-export type { QType, InternalQ, CollateItem, CollatedBatch, QuestionPrefix, SequenceStats } from "./common.js";
+export type {
+  QType,
+  InternalQ,
+  CollateItem,
+  CollatedBatch,
+  QuestionPrefix,
+  SequenceStats,
+  OptionStats,
+  MinConfidence,
+  MinConfidenceMap,
+  MinConfidenceBucket,
+  MinConfidenceKey,
+  BinningEntry,
+  BinningMap,
+} from "./common.js";
 export { q, best, topK, isConfident } from "./dx.js";
 export { bpeEncode, metaspaceEncode, encodeWithData, parseTokenizerJson, loadTokenizerJson, CHECKPOINT_IDS, SPECIAL_ALIASES, METASPACE_REPLACEMENT } from "./tokenizer.js";
 export type { TokenizerLike, TokenizerData, TokenizerIds, PreTokenizerKind } from "./tokenizer.js";

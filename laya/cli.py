@@ -4,12 +4,14 @@
     laya "Refactor this service" --predict              # full answers, loads the checkpoint
     laya                                                # interactive mode
     laya "Mein Konto wurde zweimal belastet" --lang de  # explicit language
+    laya "My payment failed twice" --lang-guess en      # a soft hint that still lets routing decide
     laya "My payment failed twice" --model ml           # pin a checkpoint, by name or alias
     laya "My payment failed twice" --preset triage      # a ready-made question preset
     laya --batch tickets.txt --predict                  # a file of requests, one per line
     cat tickets.txt | laya --batch - --predict --json   # stdin, one JSON line of answers each
     laya "Where is my card" --questions intents.json    # your own questions, from a JSON file
     laya "Where is my card" --questions intents.json --head-max-len 384
+    laya "Where is my card" --questions intents.json --min-confidence 0.7
 
 Routing (the default) never downloads a checkpoint, so it works offline and
 returns in milliseconds. --predict loads the routed checkpoint on first use,
@@ -17,12 +19,14 @@ which needs network access to the Hugging Face hub. --preset answers one of the
 ready-made question presets from laya.presets and implies --predict.
 --batch scores a whole file (or stdin, with `-`) through Router.predict_batch in one
 process, so the states share checkpoint loads and forward passes; --json prints JSONL.
-ready-made question presets from laya.presets and implies --predict. --questions
-answers the question set in a JSON file instead; --max-len and --head-max-len
-raise its token budget for the request, which is what a many-label question needs.
+--questions answers the question set in a JSON file instead; --max-len and --head-max-len
+raise its token budget for the request, which is what a many-label question needs,
+and --min-confidence marks an answer whose confidence falls below the threshold
+instead of changing it (it needs an answering mode: routing has no confidence to gate).
 """
 
 import argparse
+import inspect
 import json
 import sys
 
@@ -69,6 +73,27 @@ def model_name(value):
         raise argparse.ArgumentTypeError("%s, or 'auto'" % error) from None
 
 
+def min_confidence_value(value):
+    """Resolve a `--min-confidence` argument through core's own validator, so the range is core's.
+
+    ``laya.confidence.check_min_confidence`` is what ``Router.predict`` and ``Router.predict_batch``
+    run this argument through, so a threshold this flag accepts is exactly one the call accepts --
+    including the boolean and the infinite value that ``float()`` alone waves through
+    (``--min-confidence inf`` would ask for a gate no answer can clear).
+    """
+    from laya.confidence import check_min_confidence
+
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "expected a number in [0.0, 1.0], got %r" % value) from None
+    try:
+        return check_min_confidence(number)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="laya",
@@ -81,6 +106,10 @@ def build_parser():
                         help="force a checkpoint instead of auto-routing: a checkpoint name or any of "
                              "core's aliases, in any casing, or 'auto' to route it (the default)")
     parser.add_argument("--lang", help="force a language, e.g. en or de, instead of detecting it")
+    parser.add_argument("--lang-guess", dest="lang_guess", metavar="CODE",
+                        help="a soft language hint that participates in routing instead of skipping "
+                             "detection: checked after --lang and before the built-in detector, so a "
+                             "probable-but-uncertain code can nudge the checkpoint without forcing it")
     parser.add_argument("--task", help="force a typed-decisions workflow instead of detecting it")
     parser.add_argument("--preset", choices=sorted(PRESETS), metavar="NAME",
                         help="answer a ready-made question preset (%s) instead of the router questions; implies --predict"
@@ -94,8 +123,15 @@ def build_parser():
     parser.add_argument("--head-max-len", type=int, dest="head_max_len", metavar="N",
                         help="token budget the choice options share; raise it when a question has many"
                              " labels, so each keeps enough tokens to stay distinct")
+    parser.add_argument("--min-confidence", type=min_confidence_value, dest="min_confidence",
+                        metavar="P",
+                        help="flag an answer whose calibrated confidence falls below P (0.0-1.0) as"
+                             " low-confidence; the answer itself is kept, so this asks for a warning"
+                             " rather than a refusal. Needs --predict, --preset or --questions.")
     parser.add_argument("--device", help="torch device, e.g. cpu or cuda")
     parser.add_argument("--json", action="store_true", help="print the raw result as JSON")
+    parser.add_argument("--explain", action="store_true",
+                        help="include language-detection reasons and sources in routing mode (no model loading)")
     parser.add_argument("--batch", metavar="FILE",
                         help="score a file of requests, one per line (use '-' for stdin), instead "
                              "of a single text; implies neither --predict nor --preset, but the "
@@ -124,15 +160,46 @@ def load_questions(path):
     file declares it. Default ``"request"``, matching bare ``--predict``.
     """
     try:
-        with open(path, encoding="utf-8") as handle:
+        # `utf-8-sig`, not `utf-8`: a questions file written by Notepad or Excel starts with a
+        # UTF-8 BOM, and a plain `utf-8` read leaves it as U+FEFF, so `json.load` refuses a file
+        # that is valid JSON -- with its own "decode using utf-8-sig" hint. The other file readers
+        # in this repo open the same way for the same reason (docker/entrypoint.py,
+        # laya/train.py, scripts/http_inference_smoke.py).
+        with open(path, encoding="utf-8-sig") as handle:
             raw = json.load(handle)
     except FileNotFoundError:
         raise ValueError("no such --questions file: %s" % path)
+    except OSError as error:
+        # A path that exists but cannot be read as a file -- a directory, or one this process may
+        # not open -- is the same class of fault as the three below: it is about *this* file, not
+        # about a missing dependency or a failed checkpoint download. Letting the raw OSError reach
+        # run()'s `except (ImportError, OSError, RuntimeError)` printed "could not run Laya" and
+        # advised checking the network, which is a false diagnosis for a wrong --questions path.
+        raise ValueError("--questions file %s cannot be read: %s" % (path, error)) from error
+    # The same three refusals `laya/evidence.py::_read_json_object` makes: a bare JSONDecodeError or
+    # UnicodeDecodeError says what is wrong with the text but not which file, and a too-deep document
+    # surfaces as a RecursionError that the caller's `except (OSError, RuntimeError, ...)` misreads as
+    # a dependency/download problem. Prefix each with the path so it is a usage error about this file.
+    except json.JSONDecodeError as error:
+        raise ValueError("--questions file %s is not valid JSON: %s" % (path, error)) from error
+    except UnicodeDecodeError as error:
+        raise ValueError("--questions file %s is not UTF-8 text: %s" % (path, error)) from error
+    except RecursionError as error:
+        raise ValueError("--questions file %s is JSON nested deeper than it can be read: %s"
+                         % (path, error)) from error
     if not isinstance(raw, dict):
         raise ValueError("--questions file must be a JSON object of question id -> definition")
     state_key = "request"
     questions = raw
-    if "questions" in raw:
+    wrapper_keys = {"questions", "state_key"}
+    is_wrapped = False
+    if set(raw.keys()) <= wrapper_keys and "questions" in raw:
+        inner = raw["questions"]
+        if "state_key" in raw or not isinstance(inner, dict) or not inner:
+            is_wrapped = True
+        elif all(isinstance(v, dict) for v in inner.values()):
+            is_wrapped = True
+    if is_wrapped:
         if not isinstance(raw["questions"], dict):
             raise ValueError("the 'questions' field of the --questions file must be an object")
         questions = raw["questions"]
@@ -171,6 +238,10 @@ def show_answers(result):
             detail = "%.3f" % answer["noul"]
         else:
             detail = json.dumps(answer, ensure_ascii=False)
+        # The gate marks an unsure answer and keeps it; without this line the mark was only ever
+        # readable through --json, so a gated run at a terminal looked exactly like an ungated one.
+        if answer.get("low_confidence"):
+            detail += "  [low-confidence]"
         print("%-12s: %s" % (qid, detail))
 
 
@@ -186,6 +257,19 @@ def budget_overrides(args):
         if value is not None:
             overrides[flag] = value
     return overrides
+
+
+def abstention_override(args):
+    """`--min-confidence` as a `predict` / `predict_batch` keyword argument, absent when unset.
+
+    Separate from ``budget_overrides`` because the two reach the batch call differently: a token
+    budget is per request, so it goes inside each request dict, while ``predict_batch`` validates
+    one threshold for the whole batch and takes it as its own argument. Unset has to stay unsent
+    for the same reason as the budgets -- a ``None`` here would overwrite a Router built with its
+    own ``min_confidence``, and ``0.0`` is a real threshold, not an absence.
+    """
+    value = getattr(args, "min_confidence", None)
+    return {} if value is None else {"min_confidence": value}
 
 
 def resolve_questions(args):
@@ -216,14 +300,17 @@ def run(text, args, router=None):
             state = {state_key: text}
             result = router.predict(state, questions,
                                     model=args.model, task=args.task, lang=args.lang,
-                                    **budget_overrides(args))
+                                    lang_guess=args.lang_guess,
+                                    **budget_overrides(args), **abstention_override(args))
             if args.json:
                 print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
             else:
                 show_answers(result)
         else:
             state = {"text": text}
-            decision = router.route(state, model=args.model, task=args.task, lang=args.lang)
+            decision = router.route(state, model=args.model, task=args.task, lang=args.lang,
+                                    lang_guess=args.lang_guess,
+                                    **({"explain": True} if args.explain else {}))
             if args.json:
                 print(json.dumps(dict(decision), ensure_ascii=False, indent=2, default=str))
             else:
@@ -243,11 +330,63 @@ def run(text, args, router=None):
 def read_batch_lines(source):
     """One request per non-blank line of FILE, or of stdin for '-'."""
     if source == "-":
+        # A pipe is decoded with the locale's codec by default (cp1252 on Windows), not the utf-8 a
+        # FILE is read with, so piped non-Latin requests arrived as mojibake.
+        if hasattr(sys.stdin, "reconfigure"):
+            # `utf-8-sig` for the same reason as FILE below: a producer that wrote the stream with
+            # a Windows editor prefixes U+FEFF, which would otherwise become the first request's
+            # first character. It reads plain UTF-8 unchanged when there is no BOM.
+            sys.stdin.reconfigure(encoding="utf-8-sig")
         lines = sys.stdin.read().splitlines()
     else:
-        with open(source, encoding="utf-8") as handle:
+        # `utf-8-sig`: a batch file saved by Notepad or Excel starts with a UTF-8 BOM, which plain
+        # `utf-8` would keep as U+FEFF at the front of the first request.
+        with open(source, encoding="utf-8-sig") as handle:
             lines = handle.read().splitlines()
     return [line.strip() for line in lines if line.strip()]
+
+
+def _takes_predict_diagnostics(router) -> bool:
+    """Whether `router`'s predict_batch takes the per-group sort report of #1111.
+
+    The same signature check the evals runner makes for `sort_by_length`, but exact-name only:
+    the report is a contract with core's own Router, and a `**kwargs` forwarder would swallow
+    the dict while staying as blind as any other foreign router. Routers without the parameter
+    keep the pre-run note, whose file-wide wording is exact for the single group they predict.
+    """
+    fn = getattr(router, "predict_batch", None)
+    if fn is None:
+        return False
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "diagnostics" in parameters
+
+
+def _note_sort_report(report, total):
+    """Say what actually reordered, once core has reported it per checkpoint group."""
+    stats = report.get("sort_by_length") or {}
+    groups = stats.get("groups") or 0
+    if not groups or stats.get("reordered", 0) >= groups:
+        return
+    smallest, largest = stats.get("smallest"), stats.get("largest")
+    if groups == 1:
+        # One group saw every line, so the pre-run wording is exact there; keep its copy, with
+        # the group's own size rather than the file's, in case a cache hit shrank the batch.
+        print("note: --sort-by-length only takes effect with --batch-size N where "
+              "1 < N < %d; the states still go in one forward pass" % smallest,
+              file=sys.stderr)
+        return
+    span = "%d" % smallest if smallest == largest else "%d-%d" % (smallest, largest)
+    # The post-run counterpart of the pre-run note: instead of guessing from the file before
+    # the run, name the groups that could not reorder and the size that would have reached them.
+    print("note: --sort-by-length groups within each checkpoint batch, not across the file: "
+          "%d of %d batches (%s states) could not reorder; a batch reorders only when "
+          "--batch-size is smaller than its state count, and the smallest batch holds %d of "
+          "the file's %d lines"
+          % (groups - stats["reordered"], groups, span, smallest, total),
+          file=sys.stderr)
 
 
 def run_batch(lines, args, router=None):
@@ -255,7 +394,9 @@ def run_batch(lines, args, router=None):
     forward passes; returns 0 on success, 2 on a handled error."""
     router = router or make_router(args)
     overrides = {key: value for key, value in (("model", args.model), ("task", args.task),
-                                               ("lang", args.lang)) if value is not None}
+                                               ("lang", args.lang),
+                                               ("lang_guess", args.lang_guess))
+                 if value is not None}
     try:
         if args.predict or args.preset or getattr(args, "questions", None):
             questions, key = resolve_questions(args)
@@ -263,20 +404,31 @@ def run_batch(lines, args, router=None):
             overrides.update(budget_overrides(args))
             requests = [{"state": {key: line}, "questions": questions, **overrides}
                         for line in lines]
-            kwargs = {"batch_size": args.batch_size}
+            kwargs = {"batch_size": args.batch_size, **abstention_override(args)}
+            sort_report = None
             if args.sort_by_length:
                 # Sent only when asked for, as Router.predict_batch itself forwards it: a stub or
                 # an attached agent that predates the knob keeps working for every run that does
                 # not request it.
                 kwargs["sort_by_length"] = True
                 chunk = args.batch_size if args.batch_size and args.batch_size > 0 else len(lines)
-                if not 1 < chunk < len(lines):
+                if _takes_predict_diagnostics(router):
+                    # The reorder switches per checkpoint/question group inside core, so the
+                    # file's line count is only an upper bound on the denominators that decide
+                    # it (#1111): a file that routes to several checkpoints can reorder nothing
+                    # while `1 < chunk < len(lines)` holds. Ask core for the per-group outcome
+                    # and note after the run, when the groups are known.
+                    sort_report = {}
+                    kwargs["diagnostics"] = sort_report
+                elif not 1 < chunk < len(lines):
                     # Core documents this as a no-op rather than an error, so the shell says why
                     # the run was not reordered instead of printing a silent same-speed result.
                     print("note: --sort-by-length only takes effect with --batch-size N where "
                           "1 < N < %d; the states still go in one forward pass" % len(lines),
                           file=sys.stderr)
             results = router.predict_batch(requests, **kwargs)
+            if sort_report is not None:
+                _note_sort_report(sort_report, len(lines))
             for line, result in zip(lines, results):
                 if args.json:
                     print(json.dumps(result, ensure_ascii=False, default=str))
@@ -286,10 +438,13 @@ def run_batch(lines, args, router=None):
                     print()
         else:
             decisions = router.route_batch([{"state": {"text": line}, "questions": {},
-                                             **overrides} for line in lines])
+                                             **overrides} for line in lines],
+                                           **({"explain": True} if args.explain else {}))
             for line, decision in zip(lines, decisions):
                 if args.json:
                     print(json.dumps(dict(decision), ensure_ascii=False, default=str))
+                elif args.explain:
+                    show_decision(decision)
                 else:
                     print("%-14s %s  <- %s" % (decision["model"], decision["reason"],
                                                line if len(line) <= 48 else line[:45] + "..."))
@@ -308,6 +463,7 @@ def run_batch(lines, args, router=None):
 def interactive(args):
     print("Laya interactive mode. Type a request and press Enter; Ctrl-D or 'quit' to exit.")
     router = make_router(args)
+    code = 0
     while True:
         try:
             text = input("laya> ").strip()
@@ -316,8 +472,11 @@ def interactive(args):
             break
         if not text or text.lower() in ("quit", "exit"):
             break
-        run(text, args, router)
-    return 0
+        # A handled failure stays non-fatal to the session, but the process cannot then report
+        # success for a request it knows did not run: `laya < requests.txt` exited 0 with every
+        # answer missing and only stderr to say so.
+        code = run(text, args, router) or code
+    return code
 
 
 def main(argv=None):
@@ -325,15 +484,34 @@ def main(argv=None):
     if argv and argv[0] == "eval":       # `laya eval ...` mirrors the `laya-evals` script
         from .evals_cli import main as eval_main
         return eval_main(argv[1:])
+    if argv and argv[0] == "train":      # `laya train ...` mirrors the `laya-train` script
+        from .train_cli import main as train_main
+        return train_main(argv[1:])
     args = build_parser().parse_args(argv)
+    # Redirected output is encoded with the locale's codec by default (cp1252 on Windows), which
+    # cannot hold a non-Latin request or answer, so `laya --batch FILE > out.txt` failed with a
+    # codec error instead of writing it. utf-8 is what --batch reads back.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     text = " ".join(args.text).strip()
+    if args.explain and (args.predict or args.preset or args.questions):
+        print("laya: --explain is for routing only; omit --predict, --preset and --questions.",
+              file=sys.stderr)
+        return 2
+    # Routing answers nothing, so there is no confidence to gate: `route` does not take the
+    # threshold at all. Accepting the flag there would let `laya --min-confidence 0.9 "..."` exit 0
+    # having ignored it, which is the thing this flag exists to avoid.
+    if args.min_confidence is not None and not (args.predict or args.preset or args.questions):
+        print("laya: --min-confidence gates answers, so it needs --predict, --preset or --questions.",
+              file=sys.stderr)
+        return 2
     if args.batch:
         if text:
             print("laya: pass either a text or --batch FILE, not both.", file=sys.stderr)
             return 2
         try:
             lines = read_batch_lines(args.batch)
-        except OSError as error:
+        except (OSError, UnicodeDecodeError) as error:
             print("laya: could not read %s (%s)." % (args.batch, error), file=sys.stderr)
             return 2
         if not lines:

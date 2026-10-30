@@ -3,8 +3,27 @@ import {
   LayaTimeoutError, LayaValidationError,
 } from './errors.js';
 import type { Health, Prediction, PredictOptions, Questions, RequestOptions, State } from './types.js';
+import { isMinConfidenceKey } from './buckets.js';
 import { isRecord, validateJson, validateQuestions, validateTimeout } from './validation.js';
 import { validateHealth, validatePrediction } from './response.js';
+
+/** One threshold in `[0, 1]`: booleans are not thresholds even though they read as 0/1. */
+function isThreshold(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+/** Mirror core's `check_min_confidence`: one threshold for every answer, or a non-empty
+ *  per-bucket map whose keys core can produce and whose values are all thresholds. Anything else
+ *  is refused before the request goes out, so a caller cannot pay for inference with a gate the
+ *  server would 422. */
+function validateMinConfidence(value: unknown): asserts value is number | Record<string, number> {
+  if (isThreshold(value)) return;
+  if (isRecord(value) && Object.keys(value).length > 0
+      && Object.keys(value).every(isMinConfidenceKey)
+      && Object.values(value).every(isThreshold)) return;
+  throw new LayaValidationError(
+    'minConfidence must be a number between 0 and 1, or a non-empty map of bucket to threshold');
+}
 
 export interface LayaOptions {
   /** Server root URL, optionally including a reverse-proxy path prefix. */
@@ -66,9 +85,22 @@ export class Laya {
     if (state !== null && typeof state !== 'string' && !Array.isArray(state) && !isRecord(state)) {
       throw new LayaValidationError('state must be text, a JSON object, an array, or null');
     }
-    for (const key of ['task', 'lang']) {
-      if (key in options) throw new LayaValidationError(`${key} is not supported by /v1/systemone; use model instead`);
+    if (options.task !== undefined && (typeof options.task !== 'string' || !options.task.trim())) {
+      throw new LayaValidationError('task must be a nonempty string');
     }
+    for (const key of ['lang', 'langGuess'] as const) {
+      const value = options[key];
+      if (value !== undefined && (typeof value !== 'string' || !value.trim())) {
+        throw new LayaValidationError(`${key} must be a nonempty language code string`);
+      }
+    }
+    for (const key of ['maxLen', 'headMaxLen'] as const) {
+      const value = options[key];
+      if (value !== undefined && (!Number.isInteger(value) || value < 1)) {
+        throw new LayaValidationError(`${key} must be a positive integer`);
+      }
+    }
+    if (options.minConfidence !== undefined) validateMinConfidence(options.minConfidence);
     const model = options.model ?? this.model;
     if (model !== undefined && (typeof model !== 'string' || !model.trim())) {
       throw new LayaValidationError('model must be a nonempty string');
@@ -78,8 +110,21 @@ export class Laya {
         ? { ...question, criteria: Object.fromEntries(question.criteria.map(label => [label, null])) }
         : question,
     ]));
-    const body: { state: State; questions: typeof wireQuestions; model?: string } = { state, questions: wireQuestions };
+    const body: {
+      state: State; questions: typeof wireQuestions; model?: string; task?: string;
+      lang?: string; lang_guess?: string; max_len?: number; head_max_len?: number;
+      min_confidence?: number | Record<string, number>;
+    } = { state, questions: wireQuestions };
     if (model !== undefined) body.model = model;
+    // The per-request controls `/v1/systemone` forwards when the request sends them (see
+    // docs/http-api.md); absent options stay absent so the deployment's own Router
+    // settings remain in charge.
+    if (options.task !== undefined) body.task = options.task;
+    if (options.lang !== undefined) body.lang = options.lang;
+    if (options.langGuess !== undefined) body.lang_guess = options.langGuess;
+    if (options.maxLen !== undefined) body.max_len = options.maxLen;
+    if (options.headMaxLen !== undefined) body.head_max_len = options.headMaxLen;
+    if (options.minConfidence !== undefined) body.min_confidence = options.minConfidence;
     validateJson(body);
     return JSON.stringify(body);
   }

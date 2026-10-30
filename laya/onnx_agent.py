@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import threading
@@ -14,23 +15,62 @@ from laya.hooks import (
 from laya.revisions import resolve_revision, snapshot_revision, verify_digests
 from laya.common import (
     QTYPES,
+    _reuse_question_tokens,
     answer_confidence,
     build_sequence,
     collapsed_options,
-    collate_items,
     confidence_from_probs,
     encode_text,
     render_criterion,
-    render_options,
     resolve_lang_temperatures,
     serialize_state,
+    window_batch_cap,
+    window_budget,
     temp_bucket,
+    temperature_rejected,
     unpermute_probs,
     TEMP_MIN,
     TEMP_MAX,
     clamp_temperature,
 )
-from laya.confidence import check_min_confidence, flag_low_confidence
+from laya.confidence import apply_confidence_gate, check_min_confidence
+
+
+def _collate_items_numpy(batch: List[List[Dict[str, Any]]], pad_id: int) -> Dict[str, np.ndarray]:
+    """Collate encoded question rows across states directly into NumPy arrays for ONNX Runtime."""
+    items = [it for group in batch for it in group]
+    if not items:
+        return {}
+    n = len(items)
+    L = max(len(it["ids"]) for it in items)
+    kmax = max(len(it["markers"]) for it in items)
+    # The exported head takes `topk(2)` of the option probabilities: the eager forward's
+    # one-option branch is a Python `if`, which the trace bakes in, so ONNX Runtime refuses
+    # a run whose questions all have one option. Allocating at least 2 marker columns gives
+    # the masked second slot the act head expects without needing a post-collation np.pad.
+    k_cols = max(kmax, 2)
+
+    ids = np.full((n, L), pad_id, dtype=np.int64)
+    att = np.zeros((n, L), dtype=np.int64)
+    mpos = np.zeros((n, k_cols), dtype=np.int64)
+    mmask = np.zeros((n, k_cols), dtype=bool)
+
+    for i, it in enumerate(items):
+        it_ids = it["ids"]
+        ids[i, :len(it_ids)] = it_ids
+        att[i, :len(it_ids)] = 1
+        markers = it["markers"]
+        k = len(markers)
+        mpos[i, :k] = markers
+        mmask[i, :k] = True
+
+    return {
+        "input_ids": ids,
+        "attention_mask": att,
+        "marker_pos": mpos,
+        "marker_mask": mmask,
+        "qtype": np.array([it["qtype"] for it in items], dtype=np.int64),
+    }
 
 
 class ONNXAgent(HookRegistry):
@@ -88,6 +128,9 @@ class ONNXAgent(HookRegistry):
                                code, each `{"temperature": [3 floats], "temperature_by_options": {}}`.
                                Applied when a `lang=` is passed to `system_one`/`predict`, mirroring
                                the PyTorch `Agent`; a cross-backend swap otherwise loses calibration.
+            calibration: Optional path to a JSON map written by `Agent.save_calibration`
+                         (see `Agent.load_calibration`), read onto this agent after its
+                         checkpoint temperatures; exactly as the PyTorch `Agent` does.
         """
         self.hooks = normalise_hooks(hooks, on_predict_start, on_predict_end)
         self.hooks_raise = bool(hooks_raise)
@@ -96,6 +139,13 @@ class ONNXAgent(HookRegistry):
         self._hooks_lock = threading.RLock() if not hooks_concurrent else None
         self._hooks_mutex = threading.Lock()
         self.model_id = model_id_or_path
+        # The PyTorch `Agent` carries these two names (`agent.py:385-386`) and `calibrate`'s
+        # identity check reads them off whatever object it is handed. Without them here every v2
+        # payload's recorded checkpoint compares against `None`, so the mismatch branch always
+        # fires -- even for the very checkpoint this agent loaded. Mirror `Agent` so the check can
+        # actually match and `load_calibration`'s documented mismatch warning means something.
+        self.model_id_or_path = model_id_or_path
+        self.subfolder = subfolder
 
         import onnxruntime as ort
         from transformers import AutoTokenizer
@@ -140,6 +190,11 @@ class ONNXAgent(HookRegistry):
 
         with open(cfg_path) as f:
             self.cfg = json.load(f)
+        if self.cfg.get("option_layout", "sequential") != "sequential":
+            # The exported graph takes the five sequential-layout inputs only, so it would run this
+            # checkpoint without the masks it was trained with.
+            raise ValueError("option_layout=%r is not supported by the ONNX runtime; load this "
+                             "checkpoint with laya.Agent" % (self.cfg.get("option_layout"),))
 
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(
@@ -185,6 +240,9 @@ class ONNXAgent(HookRegistry):
         self.temperature = [clamp_temperature(t) for t in self.temperature_raw]
         self.temperature_by_options = {k: clamp_temperature(v)
                                        for k, v in self.temperature_by_options_raw.items()}
+        # Optional histogram-binning map installed by `load_calibration`; absent/None means
+        # answer_confidence is the temperature-scaled one, same as the PyTorch Agent.
+        self.binning_map = None
         # Per-language temperature overrides, through the same helper the PyTorch Agent uses, so a
         # caller can hand the same `lang_temperatures` to either backend and read the same
         # confidence -- including the same error for the same malformed input.
@@ -193,13 +251,8 @@ class ONNXAgent(HookRegistry):
         entries += [("temperature[%d]" % i, t, self.temperature[i]) for i, t in enumerate(self.temperature_raw)]
         rejected = []
         for name, raw, applied in entries:
-            try:
-                if float(raw) == applied:
-                    continue
-            except (TypeError, ValueError):
-                # Invalid entries already have a neutral fallback; diagnostics must not
-                # repeat the failed conversion or prevent the checkpoint from loading.
-                pass
+            if not temperature_rejected(raw, applied):
+                continue
             rejected.append("%s=%r -> %g" % (name, raw, applied))
         if rejected:
             warnings.warn(
@@ -211,7 +264,13 @@ class ONNXAgent(HookRegistry):
             self.load_calibration(calibration)
 
     def load_calibration(self, path: str) -> None:
-        """Read a JSON map written by `save_calibration` onto this agent."""
+        """Read a JSON map written by `save_calibration` onto this agent.
+
+        A file with no `version` is treated as version 1 and still loads. A newer file
+        whose recorded checkpoint does not match this agent warns and still loads.
+        Values that are not numbers, or that sit outside `[TEMP_MIN, TEMP_MAX]`, are clamped
+        with `clamp_temperature` the same way checkpoint load is.
+        """
         from .calibrate import apply_calibration_payload
         with open(path) as f:
             payload = json.load(f)
@@ -279,6 +338,7 @@ class ONNXAgent(HookRegistry):
                                   max_len=max_len, head_max_len=head_max_len,
                                   min_confidence=min_confidence)[0]
 
+    @_reuse_question_tokens
     def predict_batch(self, states: List[Union[str, dict, list]], questions: Dict[str, Dict[str, Any]],
                       batch_size: Optional[int] = None, lang: Optional[str] = None,
                       hooks=None, on_predict_start=None, on_predict_end=None,
@@ -374,9 +434,11 @@ class ONNXAgent(HookRegistry):
             ctx.elapsed_ms = (time.perf_counter() - ctx.started_at) * 1000.0
             if ctx.results is not None:
                 ctx.usage = aggregate_usage(ctx.results)
-                if mc is not None:
-                    flag_low_confidence(ctx.results, mc)
+                apply_confidence_gate(ctx.results, mc)
             try:
+                record_scan = getattr(ctx, "_record_scan_results", None)
+                if ctx.error is None and ctx.results is not None and record_scan is not None:
+                    record_scan(ctx)
                 dispatch(active, "on_predict_end", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             except BaseException as hook_exc:
                 if ctx.error is not None:
@@ -411,15 +473,19 @@ class ONNXAgent(HookRegistry):
         `answer["window"]` -- the deciding window's `index`, `token_start`/`token_end` into the
         tokenized state, and the window `count`.
 
-        A state that already fits one window is passed straight to `system_one` (identical output).
+        A state the questions leave room for is passed straight to `system_one` (identical output),
+        since `system_one` reads it whole; with an explicit `window`, a state that fits that window.
 
         Args:
             state: Text string, JSON dict, or conversation turn list.
             questions: Question definitions, exactly as accepted by `system_one`.
             window: State tokens per window. Defaults to the per-question state budget
-                    (`max_len - head_max_len - 8`). Smaller windows isolate a localized signal
-                    better at the cost of more windows, as in `Agent.predict_long`.
-            stride: Token step between windows. Defaults to `window // 2` (50% overlap).
+                    (`max(64, max_len - head_max_len - 8)`; the 64 is a floor). Smaller windows
+                    isolate a localized signal better at the cost of more windows, as in
+                    `Agent.predict_long`.
+            stride: Token step between windows. Defaults to half the *effective* window -- the
+                    window these questions leave room for, which is smaller than the `window` that
+                    was asked for once the room caps it (50% overlap either way).
             aggregate: "auto" (the per-type rules above) is the only mode for now.
             batch_size: Cap on windows per session run, to bound peak memory on very long states.
             lang: Per-language temperature selection, as in `system_one`.
@@ -427,7 +493,8 @@ class ONNXAgent(HookRegistry):
                     follow `Agent.predict_long`'s contract: they wrap the inference that answers
                     the state, a start hook that answers with `ctx.skip(...)` gets
                     `usage["windows"] == 0` and no window attribution, and a rewritten scan is
-                    aggregated without `answer["window"]`.
+                    aggregated without `answer["window"]`. End-hook result reordering keeps an
+                    unchanged answer's original span; cloned, replaced or edited answers omit it.
             on_predict_start (PredictHookArg): A per-call start hook, as in `system_one`.
             on_predict_end (PredictHookArg): A per-call end hook, as in `system_one`.
             hooks_raise: Override the agent's `hooks_raise` for this call.
@@ -438,7 +505,7 @@ class ONNXAgent(HookRegistry):
         in `Agent.predict_long`: `truncated` is a window count and `truncated_questions` is the
         last window's list, so `truncated` can be above 0 while the list is empty.
         """
-        from .agent import _start_evidence, _with_start_probe
+        from .agent import _check_scan_budget, _scan_answer_index, _start_evidence, _with_start_probe
         from .hooks import aggregate_usage
 
         hook_kwargs = {"hooks": hooks, "on_predict_start": on_predict_start,
@@ -453,7 +520,33 @@ class ONNXAgent(HookRegistry):
             raise ValueError("predict_long: only aggregate='auto' is supported")
         max_len = self.cfg.get("max_len", 512)
         head_max_len = self.cfg.get("head_max_len", 192)
-        budget = window if (window and window > 0) else max(64, max_len - head_max_len - 8)
+        # The same cap the torch `Agent.predict_long` applies, for the same reason: a window wider
+        # than the room these questions leave is re-truncated by `build_sequence` on the way into
+        # `predict_batch`, so its tail reaches no model while `answer["window"]` reports the whole
+        # span -- and once the room falls below the default stride the windows stop overlapping and
+        # leave tokens no window reads at all. `README.md` and `Router.predict_long` document this
+        # contract for both agents, so both have to honour it.
+        ids = list(questions.keys())
+        # Validate before `_to_internal`, which does none: hoisting only `_to_internal` ahead of the
+        # hooks turned the ValueError `_check_question` exists to raise into
+        # `AttributeError: 'NoneType' object has no attribute 'items'` -- verbatim the message its
+        # own docstring says it prevents, and a regression from `main` on this path. The torch
+        # `predict_long` hoists both. `laya.serve` maps ValueError to 422 and anything else to 500.
+        from .agent import Agent as _Agent           # deferred, as `predict_batch` does
+
+        for qid in ids:
+            _Agent._check_question(qid, questions[qid])
+        internal = {qid: self._to_internal(questions[qid]) for qid in ids}
+        budget, step_default, room = window_budget(self.tok, [internal[qid] for qid in ids], max_len,
+                                                   head_max_len, window=window, stride=stride)
+        # Snapshot the questions the scan was just sized against, BEFORE any start hook can
+        # rewrite them, as the torch `predict_long` does (5f29170). `==` over the caller's mapping
+        # cannot see an in-place rewrite: a hook that adds options to `ctx.questions[q]["criteria"]`
+        # -- the `widen_for_high_cardinality` pattern in `docs/hooks/patterns.md` -- mutates the
+        # same nested dict, so both sides change together, `_check_scan_budget` returns early, and
+        # the windows are re-truncated while `usage["windows"]` reports them all read. A shallow
+        # copy shares the nested dicts and misses it exactly the same way.
+        asked = copy.deepcopy(questions)
 
         state_ids = encode_text(
             self.tok,
@@ -462,14 +555,21 @@ class ONNXAgent(HookRegistry):
         )["input_ids"]
         # Fits in one window: identical to a plain call, no windowing overhead. `windows` is still
         # written, as on the torch Agent: 1 for a window the model read, 0 for a hook's answer.
-        if len(state_ids) <= budget:
+        # "Fits" is the room the questions leave, not the default window, as on the torch Agent.
+        if len(state_ids) <= (budget if window and window > 0 else room):
             probe, evidence = _start_evidence()
             single = dict(self.system_one(state, questions, lang=lang,
                                           **_with_start_probe(hook_kwargs, probe)))
+            # The same budget check as the multi-window path. Without it a document short enough to
+            # fit one window was silently truncated by a re-budgeting hook and still reported
+            # `windows: 1`, i.e. "the model read all of it" -- measured, 138 of 240 state tokens
+            # never reached the model, while a longer document on the identical input hard-failed.
+            _check_scan_budget(self, evidence, max(budget, len(state_ids)), max_len, head_max_len,
+                               asked)
             single["usage"] = {**(single.get("usage") or {}), "windows": 0 if evidence["answered"] else 1}
             return single
 
-        step = stride if (stride and stride > 0) else max(1, budget // 2)
+        step = step_default
         windows, starts = [], []
         i, n = 0, len(state_ids)
         while i < n:
@@ -481,10 +581,20 @@ class ONNXAgent(HookRegistry):
                 break
             i += step
 
-        probe, evidence = _start_evidence()
+        probe, evidence = _start_evidence(track_answers=True)
         # A copy, so a start hook that mutates `ctx.states` in place cannot shift `starts`.
-        results = self.predict_batch(list(windows), questions, batch_size=batch_size, lang=lang,
+        # Bound one forward pass to what the un-capped scan would have used; see
+        # `window_batch_cap`. An explicit batch_size is honoured untouched.
+        cap = window_batch_cap(len(windows), budget, max(64, max_len - head_max_len - 8),
+                               batch_size)
+        results = self.predict_batch(list(windows), questions, batch_size=cap, lang=lang,
                                      **_with_start_probe(hook_kwargs, probe))
+        # Same check as the torch agent, for the same reason and on the same contract: a start hook
+        # re-budgets an ONNX scan exactly as it re-budgets a torch one (`predict_batch` applies
+        # `ctx.max_len`/`ctx.head_max_len` identically), so leaving it off here meant the bug was
+        # fully live on this path while the other agent refused the identical input -- measured,
+        # 34.6% of a document reaching no model.
+        _check_scan_budget(self, evidence, budget, max_len, head_max_len, asked)
 
         if evidence["answered"]:
             # A hook answered the document before any window was scored: pass that answer
@@ -517,6 +627,14 @@ class ONNXAgent(HookRegistry):
             question_types = {qid: self._to_internal(qdef)["t"] for qid, qdef in questions.items()}
         answers = {}
         for qid, qtype in question_types.items():
+            missing = sum(qid not in r["answers"] for r in results)
+            if missing:
+                # End hooks may remove start-added questions, but must not hide a missing
+                # caller answer or an inconsistent set of answers across windows.
+                if missing == len(results) and qid not in asked and evidence["question_types"] is not None:
+                    continue
+                raise ValueError("predict_long: answer %r is missing from %d of %d windows after prediction hooks"
+                                 % (qid, missing, len(results)))
             per = [r["answers"][qid] for r in results]
             if qtype == "noul":
                 # Evidence anywhere: the strongest window decides, carrying its own P(true),
@@ -526,11 +644,14 @@ class ONNXAgent(HookRegistry):
                 # choice / score: the most-confident window wins, preserving a localized signal
                 # that averaging over a mostly-neutral document would drown.
                 best = max(range(len(per)), key=lambda j: float(per[j]["answer_confidence"]))
-            ans = per[best]
+            original = per[best]
+            index = None if rewritten else _scan_answer_index(evidence, qid, original, best)
+            ans = dict(original)
+            ans.pop("window", None)
             # Name the window that decided; the probability is that window's, not the document's.
-            if not rewritten:
-                ans["window"] = {"index": best, "token_start": starts[best],
-                                 "token_end": min(starts[best] + budget, len(state_ids)),
+            if index is not None:
+                ans["window"] = {"index": index, "token_start": starts[index],
+                                 "token_end": min(starts[index] + budget, len(state_ids)),
                                  "count": len(results)}
             answers[qid] = ans
         # Aggregate usage generically so fields predict_batch may grow later are propagated
@@ -554,7 +675,11 @@ class ONNXAgent(HookRegistry):
                     usage[key] = val
         usage["output_tokens"] = 0
         usage["windows"] = len(results)
-        return {"model": "laya-rl-agent-onnx", "answers": answers, "usage": usage}
+        result = {"model": "laya-rl-agent-onnx", "answers": answers, "usage": usage}
+        # As in `Agent.predict_long`: no `min_confidence` here, and the gate called with None
+        # writes nothing -- the payload comes back with no `abstention` field at all.
+        apply_confidence_gate([result], None)
+        return result
 
     def _infer(self, state: Union[str, dict, list], questions: Dict[str, Dict[str, Any]],
                max_len: Optional[int] = None, head_max_len: Optional[int] = None,
@@ -585,7 +710,7 @@ class ONNXAgent(HookRegistry):
                 truncate_left=truncate_left, state_ids=state_ids, return_stats=True,
                 return_truncation_stats=True,
             )
-            n_opts = len(render_options(q))
+            n_opts = stats["options"]
             if len(markers) != n_opts:
                 # Same diagnosis as `Agent._encode_state`, so both backends report the same thing.
                 # The markers are placed at absolute positions and `build_sequence` drops the ones
@@ -607,6 +732,9 @@ class ONNXAgent(HookRegistry):
                         lang: Optional[str] = None) -> Dict[str, Any]:
         """Decode the `len(ids)` head rows starting at `offset` into this state's answers."""
         answers = {}
+        binning_map = getattr(self, "binning_map", None)
+        if binning_map:
+            from .calibrate import apply_binning_map
         for r, qid in enumerate(ids):
             q = internal[qid]
             k = len(items[r]["markers"])
@@ -617,7 +745,7 @@ class ONNXAgent(HookRegistry):
                 t_scale = l_cfg["temperature_by_options"].get(temp_bucket(qt, k), l_cfg["temperature"][qt])
             z = logits[offset + r, :k] / t_scale
             p = np.exp(z - z.max())
-            p = p / p.sum()
+            p /= p.sum()
 
             # The row comes back in slot order; everything below indexes by option.
             p = unpermute_probs(p, q.get("option_order"))
@@ -626,7 +754,14 @@ class ONNXAgent(HookRegistry):
             # `answer_confidence` is the calibrated max(p) confidence, reported on every question
             # type so a caller can gate across types on one number -- matching the PyTorch Agent,
             # whose output ONNX callers otherwise cannot read (KeyError on cross-backend swap).
-            ans_conf = round(answer_confidence(p, k), 4)
+            ans_raw = answer_confidence(p, k)
+            lang_override = bool(lang and lang.split("-")[0].lower() in self.lang_temperatures)
+            if binning_map and not lang_override:
+                ans_conf = round(
+                    apply_binning_map(ans_raw, temp_bucket(qt, k), binning_map), 4
+                )
+            else:
+                ans_conf = round(ans_raw, 4)
             ext = {"act_probability": round(float(act[offset + r, 0]), 4)}
 
             if q["t"] == "choice":
@@ -704,16 +839,7 @@ class ONNXAgent(HookRegistry):
                 indices = order[offset:offset + chunk]
                 per_state_items = [encoded[i] for i in indices]
 
-                b = collate_items(per_state_items, self.tok.pad_token_id)
-
-                # Prepare ONNX inputs as numpy arrays
-                ort_inputs = {
-                    "input_ids": b["input_ids"].numpy().astype(np.int64),
-                    "attention_mask": b["attention_mask"].numpy().astype(np.int64),
-                    "marker_pos": b["marker_pos"].numpy().astype(np.int64),
-                    "marker_mask": b["marker_mask"].numpy().astype(bool),
-                    "qtype": b["qtype"].numpy().astype(np.int64),
-                }
+                ort_inputs = _collate_items_numpy(per_state_items, self.tok.pad_token_id)
 
                 # Run ONNX inference
                 ort_outs = self.session.run(["logits", "act_logits"], ort_inputs)
@@ -723,7 +849,7 @@ class ONNXAgent(HookRegistry):
                 # Compute softmax for actions manually in numpy
                 act_exp = np.exp(act_logits - np.max(act_logits, axis=-1, keepdims=True))
                 act = act_exp / np.sum(act_exp, axis=-1, keepdims=True)
-                att = b["attention_mask"]
+                att = ort_inputs["attention_mask"]
 
                 row = 0
                 for index, items in zip(indices, per_state_items):

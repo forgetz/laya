@@ -1,10 +1,41 @@
-import { describe, expect, it } from "vitest";
-import { Agent, Router } from "../src/index.js";
+import { describe, expect, it, vi } from "vitest";
+import { Agent, Router, clearDefaultHooks, setDefaultHooks } from "../src/index.js";
 import type { BatchRequest } from "../src/index.js";
 
 // TS mirror of tests/test_router_batch.py and the orchestration part of tests/test_batch.py.
 
 const Q = { intent: { type: "noul", instructions: "Relevant?" } } as const;
+
+// A stateful default hook must not run again inside the Agent after the Router has
+// already expanded its questions (as OptionStabilityHook does).
+it.each([false, true])("runs process defaults once per request with fallback=%s", async (fallback) => {
+  const starts: unknown[] = [];
+  const ends: unknown[] = [];
+  const agent = new Agent({ provider: {
+    async runEncoder(batch) { return { lastHidden: batch.inputIds.map(() => [[0]]) }; },
+    async runHead(_hidden, batch) {
+      return { logits: batch.qtype.map(() => [2, 0]), act: batch.qtype.map(() => [3, 0]) };
+    },
+  } });
+  const loaded = fallback ? { systemOne: agent.systemOne.bind(agent) } : agent;
+  const router = new Router({ default: "english", loader: (() => loaded) as never });
+  setDefaultHooks({
+    onPredictStart(ctx) { starts.push([...ctx.states]); },
+    onPredictEnd(ctx) { ends.push([...ctx.states]); },
+  });
+  try {
+    const results = await router.predictBatch([
+      { state: "first request", questions: Q },
+      { state: "second request", questions: Q },
+    ]);
+    expect(results).toHaveLength(2);
+    expect(starts).toEqual([["first request"], ["second request"]]);
+    // Ends unwrap in reverse start order: every request started before any ended.
+    expect(ends).toEqual([...starts].reverse());
+  } finally {
+    clearDefaultHooks();
+  }
+});
 const req = (state: unknown, overrides: Record<string, unknown> = {}): BatchRequest =>
   ({ state, questions: Q, ...overrides }) as unknown as BatchRequest;
 
@@ -37,7 +68,7 @@ const makeRouter = (opts: Record<string, unknown> = {}) => {
       },
     };
   };
-  const router = new Router({ loader: loader as never, ...opts });
+  const router = new Router({ default: "english", loader: loader as never, ...opts });
   return { router, built, calls };
 };
 
@@ -85,6 +116,9 @@ describe("Router.routeBatch / predictBatch", () => {
     expect(() => router.routeBatch([null] as never)).toThrow(/request 0/);
     expect(() => router.routeBatch([{ questions: Q }] as never)).toThrow(
       /request 0 is missing required key 'state'/,
+    );
+    expect(() => router.routeBatch([{ state: null, questions: Q }] as never)).toThrow(
+      /request 0 'state' must not be None/,
     );
     expect(() => router.routeBatch([{ state: "x" }] as never)).toThrow(
       /request 0 is missing required key 'questions'/,
@@ -172,6 +206,221 @@ describe("Router.routeBatch / predictBatch", () => {
       ["zulu", "alpha"],
       ["alpha", "zulu"],
     ]);
+  });
+
+  it("accepts per-call hooks in predict order, and treats null and [] as no-ops", async () => {
+    const order: string[] = [];
+    const installed = {
+      onRoute(ctx: { states: unknown[] }) {
+        order.push(`installed:route:${ctx.states[0]}`);
+      },
+      onPredictStart(ctx: { states: unknown[] }) {
+        order.push(`installed:start:${ctx.states[0]}`);
+      },
+      onPredictEnd(ctx: { states: unknown[] }) {
+        order.push(`installed:end:${ctx.states[0]}`);
+      },
+    };
+    const perCall = {
+      onRoute(ctx: { states: unknown[] }) {
+        order.push(`percall:route:${ctx.states[0]}`);
+      },
+      onPredictStart(ctx: { states: unknown[] }) {
+        order.push(`percall:start:${ctx.states[0]}`);
+      },
+      onPredictEnd(ctx: { states: unknown[] }) {
+        order.push(`percall:end:${ctx.states[0]}`);
+      },
+    };
+    const { router } = makeRouter({ hooks: [installed] });
+    const items = [req("one", { model: "english" }), req("two", { model: "english" })];
+    const results = await router.predictBatch(items, null, { hooks: [perCall] });
+    expect(results.map((r) => r.answers.seen)).toEqual(["one", "two"]);
+    // routeBatch runs before any predict hook. End hooks unwind in REVERSE start order (the
+    // LIFO rule Python's Router.predict_batch documents), and within one request the installed
+    // hook still runs before the per-call one.
+    expect(order).toEqual([
+      "installed:route:one",
+      "percall:route:one",
+      "installed:route:two",
+      "percall:route:two",
+      "installed:start:one",
+      "percall:start:one",
+      "installed:start:two",
+      "percall:start:two",
+      "installed:end:two",
+      "percall:end:two",
+      "installed:end:one",
+      "percall:end:one",
+    ]);
+
+    order.length = 0;
+    await router.predictBatch(items, null, { hooks: null });
+    const noneOrder = [...order];
+    order.length = 0;
+    await router.predictBatch(items, null, { hooks: [] });
+    const emptyOrder = [...order];
+    order.length = 0;
+    await router.predictBatch(items);
+    expect(noneOrder).toEqual(emptyOrder);
+    expect(emptyOrder).toEqual(order);
+    expect(noneOrder).toEqual([
+      "installed:route:one",
+      "installed:route:two",
+      "installed:start:one",
+      "installed:start:two",
+      "installed:end:two",
+      "installed:end:one",
+    ]);
+
+    const { router: bare } = makeRouter();
+    expect((await bare.predictBatch(items, null, { hooks: null })).map((r) => r.answers.seen)).toEqual([
+      "one",
+      "two",
+    ]);
+    expect((await bare.predictBatch(items, null, { hooks: [] })).map((r) => r.answers.seen)).toEqual([
+      "one",
+      "two",
+    ]);
+  });
+
+  it("runs per-call onPredictStart and onPredictEnd once per request", async () => {
+    const events: string[] = [];
+    const { router, calls } = makeRouter();
+    const items = [req("one", { model: "english" }), req("two", { model: "english" })];
+    const results = await router.predictBatch(items, null, {
+      onPredictStart(ctx) {
+        events.push(`start:${ctx.states[0]}`);
+      },
+      onPredictEnd(ctx) {
+        events.push(`end:${ctx.states[0]}`);
+      },
+    });
+    expect(results.map((r) => r.answers.seen)).toEqual(["one", "two"]);
+    expect(calls.length).toBe(1);
+    // Starts run for every request in the checkpoint group, then ends, in REVERSE start
+    // order -- the LIFO unwind Python's Router.predict_batch documents.
+    expect(events).toEqual(["start:one", "start:two", "end:two", "end:one"]);
+  });
+
+  it("ends three request contexts in reverse start order", async () => {
+    // Two requests cannot tell FIFO from LIFO apart in a way that names the rule, and this is
+    // the shape a tracing hook depends on: start a, b, c then end c, b, a.
+    const events: string[] = [];
+    const { router } = makeRouter();
+    await router.predictBatch(
+      [req("a", { model: "english" }), req("b", { model: "english" }), req("c", { model: "english" })],
+      null,
+      {
+        onPredictStart(ctx) {
+          events.push(`start:${ctx.states[0]}`);
+        },
+        onPredictEnd(ctx) {
+          events.push(`end:${ctx.states[0]}`);
+        },
+      },
+    );
+    expect(events).toEqual([
+      "start:a", "start:b", "start:c",
+      "end:c", "end:b", "end:a",
+    ]);
+  });
+
+  it("hooksRaise false swallows a throwing per-call hook; the default still raises", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const items = [req("one", { model: "english" }), req("two", { model: "english" })];
+      const { router } = makeRouter();
+      await expect(
+        router.predictBatch(items, null, {
+          onPredictStart() {
+            throw new Error("hook failed");
+          },
+        }),
+      ).rejects.toThrow("hook failed");
+
+      const { router: quietByDefault } = makeRouter({ hooksRaise: false });
+      const quiet = await quietByDefault.predictBatch(items, null, {
+        onPredictStart() {
+          throw new Error("installed policy");
+        },
+      });
+      expect(quiet.map((r) => r.answers.seen)).toEqual(["one", "two"]);
+
+      const seen: string[] = [];
+      const { router: perCall } = makeRouter();
+      const results = await perCall.predictBatch(items, null, {
+        hooksRaise: false,
+        onPredictStart(ctx) {
+          seen.push(String(ctx.states[0]));
+          throw new Error("per-call policy");
+        },
+      });
+      expect(seen).toEqual(["one", "two"]);
+      expect(results.map((r) => r.answers.seen)).toEqual(["one", "two"]);
+      expect(warn.mock.calls.some((args) => String(args[0]).includes("per-call policy"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // Two gaps the cases above leave open, both named when #943 was closed in favour of #936.
+  it("lets a per-call hooksRaise turn raising on where the router has it off", async () => {
+    const throwing = {
+      onPredictEnd() {
+        throw new Error("hook blew up");
+      },
+    };
+    const quiet = makeRouter({ hooks: [throwing], hooksRaise: false });
+    // Router-level off, nothing per-call: the hook throws and the call still succeeds.
+    expect((await quiet.router.predictBatch([req("s", { model: "english" })])).length).toBe(1);
+
+    const loud = makeRouter({ hooks: [throwing], hooksRaise: false });
+    // The override only means something if it is honoured here: without it this resolves.
+    await expect(
+      loud.router.predictBatch([req("s", { model: "english" })], null, { hooksRaise: true }),
+    ).rejects.toThrow("hook blew up");
+  });
+
+  it("appends per-call callbacks after per-call hooks, the composition predict uses", async () => {
+    // Order, not membership: both entries run under either composition, so only the sequence
+    // fails if the arguments to composeHooks are swapped.
+    const order: string[] = [];
+    const { router } = makeRouter({});
+    await router.predictBatch([req("s", { model: "english" })], null, {
+      hooks: [{
+        onPredictStart() {
+          order.push("hooks");
+        },
+      }],
+      onPredictStart() {
+        order.push("onPredictStart");
+      },
+    });
+    expect(order).toEqual(["hooks", "onPredictStart"]);
+  });
+
+  it("predictMany forwards onPredictStart, onPredictEnd and hooksRaise", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const events: string[] = [];
+      const { router } = makeRouter();
+      const items = [req("one", { model: "english" }), req("two", { model: "english" })];
+      const results = await router.predictMany(items, null, {
+        hooksRaise: false,
+        onPredictStart(ctx) {
+          events.push(`start:${ctx.states[0]}`);
+          if (ctx.states[0] === "one") throw new Error("start failed");
+        },
+        onPredictEnd(ctx) {
+          events.push(`end:${ctx.states[0]}`);
+        },
+      });
+      expect(results.map((r) => r.answers.seen)).toEqual(["one", "two"]);
+      expect(events).toEqual(["start:one", "start:two", "end:two", "end:one"]);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("runs router hooks per request and short-circuits skipped requests", async () => {
@@ -375,5 +624,48 @@ describe("Agent.predictBatch", () => {
     });
     expect(results[0].model).toBe("cached");
     expect(encodeCalls).toEqual([]);
+  });
+
+  it("router.decideBatch evaluates schema across batch", async () => {
+    const customLoader = () => ({
+      async predictBatch(states: unknown[]) {
+        return states.map(() => ({
+          model: "fake",
+          answers: { flag: { type: "noul", noul: 0.1, confidence: 0.2, answer_confidence: 0.2 } },
+        }));
+      },
+      async systemOne(state: unknown) {
+        return {
+          model: "fake",
+          answers: { flag: { type: "noul", noul: 0.1, confidence: 0.2, answer_confidence: 0.2 } },
+        };
+      },
+    });
+    const router = new Router({ loader: customLoader as never });
+    const schema = {
+      type: "object",
+      properties: {
+        flag: { type: "boolean" },
+      },
+    };
+    const res1 = await router.decideBatch(["alpha", "beta"], schema);
+    expect(res1).toHaveLength(2);
+    expect(res1[0].flag).toBe(false);
+
+    const res2 = await router.decideBatch(["alpha"], schema, { returnDetails: true });
+    expect(res2).toHaveLength(1);
+    expect(res2[0].values).toBeDefined();
+    expect(res2[0].answerConfidence).toBeDefined();
+    expect(res2[0].confidence).toBeDefined();
+
+    // Verify min_confidence alias gates low confidence on the router path
+    const resGated = await router.decideBatch(["alpha"], schema, { min_confidence: 0.99 });
+    expect(resGated).toHaveLength(1);
+    expect(resGated[0].flag).toBeNull();
+
+    // Verify minConfidence also gates low confidence on the router path
+    const resGatedCamel = await router.decideBatch(["alpha"], schema, { minConfidence: 0.99 });
+    expect(resGatedCamel).toHaveLength(1);
+    expect(resGatedCamel[0].flag).toBeNull();
   });
 });

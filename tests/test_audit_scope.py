@@ -86,14 +86,14 @@ if len(od) > 1:
 
 check_true("pyproject/core parses", len(core) == 5, core)
 check("pyproject/extra tables found", sorted(extras),
-      ["crewai", "fast", "langchain", "langgraph", "llamaindex", "mcp", "onnx", "serve",
+      ["agno", "crewai", "fast", "langchain", "langgraph", "llamaindex", "mcp", "onnx", "serve",
        "structured"])
 declared = list(core) + [s for names in extras.values() for s in names]
 expected = sorted(set(declared))
 check("pyproject/extras add names the core does not have",
       sorted({re.split(r"[<>=!;\[ ]", s)[0] for s in declared}
              - {re.split(r"[<>=!;\[ ]", s)[0] for s in core}),
-      ["crewai", "fastapi", "langchain-core", "langgraph", "llama-index-core", "mcp", "onnx",
+      ["agno", "crewai", "fastapi", "langchain-core", "langgraph", "llama-index-core", "mcp", "onnx",
        "onnxruntime", "onnxscript", "pydantic", "python-multipart", "tilelang", "uvicorn"])
 
 # The two scopes: shipped (blocking) is the core plus [serve]; everything else is advisory.
@@ -102,6 +102,15 @@ advisory = sorted(set(declared) - set(shipped))
 check_true("pyproject/scope split covers every declared name",
            sorted(set(shipped) | set(advisory)) == expected and not set(shipped) & set(advisory),
            "shipped and advisory must partition the declared specs")
+
+# The blocking scope rests on one declaration-level fact: the image installs the [serve] extra
+# and no other (#694 review). If the Dockerfile ever reads `pip install ".[serve,onnx]"`, onnx
+# would ship in the image while sitting in the advisory bucket, and nothing would go red.
+dockerfile = read("Dockerfile")
+image_extras = sorted({e.strip()
+                       for group in re.findall(r"pip install[^\n]*?\.\[([^\]]*)\]", dockerfile)
+                       for e in group.split(",") if e.strip()})
+check("Dockerfile/the image installs only the [serve] extra", image_extras, ["serve"])
 
 # ---------------------------------------------------------------- the job's own extractors
 deps_job = "\n".join(section(read(os.path.join(".github", "workflows", "security.yml")),
@@ -160,6 +169,10 @@ check_true("security.yml/extras findings are advisory without swallowing tooling
            and "::warning::" in deps_job
            and "::error::" in deps_job,
            "#646: a findings report warns, a broken audit (no report) must still fail the job")
+check_true("security.yml/the advisory annotation names the advisories themselves",
+           re.search(r"ids=\$\(grep[^\n]*(GHSA|PYSEC)[^\n]*pip-audit-extras\.log", deps_job) is not None
+           and "${ids" in deps_job,
+           "a triager reads WHAT was found from the annotation, not by opening the log (#694 review)")
 
 ran = False
 if sys.version_info >= (3, 11) and core_extractor and extras_extractor:

@@ -55,7 +55,16 @@ class LayaTaskGuardError(ValueError):
 # `predict` call and the same laya-serve request body, and three copies of the rule is how two of
 # them came to forward only `model`.
 from ._controls import budget_kwargs as _budget_kwargs, hook_kwargs as _hook_kwargs  # noqa: E402
+from ._controls import decision_kwargs as _decision_kwargs  # noqa: E402
 from ._controls import predict_kwargs as _predict_kwargs, reject_remote_hooks as _reject_remote_hooks  # noqa: E402
+from ._guard import answer_number as _answer_number  # noqa: E402
+from ._guard import answers_map as _answers_map  # noqa: E402
+from ._guard import malformed as _malformed  # noqa: E402
+from ._guard import score_violation_probability as _score_violation_probability  # noqa: E402
+from ..confidence import _gate_confidence  # noqa: E402
+from ._controls import reject_remote_lang_guess as _reject_remote_lang_guess  # noqa: E402
+from ._controls import require_router_controls as _require_router_controls  # noqa: E402
+from ._controls import router_kwargs as _router_kwargs  # noqa: E402
 
 # One class for every integration, so `except LayaLowConfidenceError` catches all of them.
 from ._errors import LayaLowConfidenceError  # noqa: E402
@@ -146,11 +155,20 @@ def _call_remote(
     timeout: float = 10.0,
     max_len: Optional[int] = None,
     head_max_len: Optional[int] = None,
+    lang: Optional[str] = None,
+    min_confidence: Optional[float] = None,
+    task: Optional[str] = None,
+    lang_guess: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Send decision request to a remote laya-serve HTTP instance using standard library urllib.
 
     `max_len` / `head_max_len` travel in the body; laya-serve applies them up to its
-    `LAYA_MAX_TOKEN_BUDGET` ceiling and answers a larger value with 422.
+    `LAYA_MAX_TOKEN_BUDGET` ceiling and answers a larger value with 422. `lang` / `min_confidence`
+    ride in the same body (they are laya-serve `BODY_CONTROLS` too): the language codes the state
+    is routed and answered in, and core's abstention gate. `task` names the checkpoint that answers
+    and `lang_guess` is the language code routing reads before its own detection -- both are
+    laya-serve body controls too, and only `lang_guess`'s string form has a wire representation
+    (`reject_remote_lang_guess` refuses the callable before the request).
     """
     url = base_url.rstrip("/")
     if not url.endswith("/v1/systemone"):
@@ -163,6 +181,14 @@ def _call_remote(
         payload["max_len"] = max_len
     if head_max_len is not None:
         payload["head_max_len"] = head_max_len
+    if lang is not None:
+        payload["lang"] = lang
+    if min_confidence is not None:
+        payload["min_confidence"] = min_confidence
+    if task is not None:
+        payload["task"] = task
+    if lang_guess is not None:
+        payload["lang_guess"] = lang_guess
 
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -173,12 +199,34 @@ def _call_remote(
     opener = urllib.request.build_opener(_SameOriginRedirectHandler())
     try:
         with opener.open(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            parsed = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Laya server error {e.code}: {body}") from e
     except Exception as e:
         raise RuntimeError(f"Failed to connect to Laya server at {url}: {e}") from e
+    # A remote laya-serve answers with a JSON object, but `json.loads` accepts any top-level value:
+    # a gateway, a mis-pointed `base_url`, or a proxy error page can reply with a bare array, string,
+    # number or `true`/`null`. Consumers read the result with `res.get("answers", …)` (the delegation
+    # lookup and the guardrail screen), so a non-object leaks ``AttributeError: 'list' object has no
+    # attribute 'get'`` instead of the ``RuntimeError`` every other remote failure here already
+    # raises. The check sits after the ``try`` so it is not swallowed by the catch-all above.
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"Malformed decision response from Laya server at {url}: "
+            f"expected a JSON object, got {type(parsed).__name__}"
+        )
+    # `parsed` is an object now, but its `answers` field is the same arbitrary JSON: a gateway can
+    # answer `{"answers": []}`. Both consumers read it as `res.get("answers", {})` and then call
+    # `.get("delegation", …)` / `.items()` on it, so a non-object there leaks AttributeError past the
+    # same fail-closed paths -- this is the guard above one level deeper. A missing `answers` is left
+    # alone: that is the no-decision case the consumers already handle, not a malformed one.
+    if "answers" in parsed and not isinstance(parsed["answers"], dict):
+        raise RuntimeError(
+            f"Malformed decision response from Laya server at {url}: "
+            f"'answers' must be a JSON object, got {type(parsed['answers']).__name__}"
+        )
+    return parsed
 
 
 _DEFAULT_ROUTER = None
@@ -204,6 +252,10 @@ def _execute_decision(
     model: Optional[str] = None,
     max_len: Optional[int] = None,
     head_max_len: Optional[int] = None,
+    lang: Optional[str] = None,
+    min_confidence: Optional[float] = None,
+    task: Optional[str] = None,
+    lang_guess: Optional[Any] = None,
     hooks: Optional[Any] = None,
     on_predict_start: Optional[Any] = None,
     on_predict_end: Optional[Any] = None,
@@ -216,12 +268,17 @@ def _execute_decision(
     LlamaIndex wrappers -- they end at the same `predict` call and the same request body.
     """
     hook_kwargs = _hook_kwargs(hooks, on_predict_start, on_predict_end, hooks_raise, hooks_timeout)
+    router_kwargs = _router_kwargs(task, lang_guess)
     if base_url:
         _reject_remote_hooks(hook_kwargs, base_url)
+        _reject_remote_lang_guess(router_kwargs, base_url)
         budget = _budget_kwargs(max_len, head_max_len)
-        return _call_remote(base_url, state, questions, api_key=api_key, model=model, **budget)
+        decision = _decision_kwargs(lang, min_confidence)
+        return _call_remote(base_url, state, questions, api_key=api_key, model=model,
+                            **budget, **decision, **router_kwargs)
     runner = agent if agent is not None else _get_default_router()
-    kwargs = _predict_kwargs(model, max_len, head_max_len)
+    kwargs = _predict_kwargs(model, max_len, head_max_len, lang, min_confidence)
+    kwargs.update(_require_router_controls(runner, "predict", router_kwargs))
     kwargs.update(hook_kwargs)
     return runner.predict(state, questions, **kwargs)
 
@@ -245,6 +302,10 @@ class LayaCrewRouter:
         model: Optional[str] = None,
         max_len: Optional[int] = None,
         head_max_len: Optional[int] = None,
+        lang: Optional[str] = None,
+        min_confidence: Optional[float] = None,
+        task: Optional[str] = None,
+        lang_guess: Optional[Any] = None,
         hooks: Optional[Any] = None,
         on_predict_start: Optional[Any] = None,
         on_predict_end: Optional[Any] = None,
@@ -261,6 +322,10 @@ class LayaCrewRouter:
         self.model = model
         self.max_len = max_len
         self.head_max_len = head_max_len
+        self.lang = lang
+        self.min_confidence = min_confidence
+        self.task = task
+        self.lang_guess = lang_guess
         self.hooks = hooks
         self.on_predict_start = on_predict_start
         self.on_predict_end = on_predict_end
@@ -297,6 +362,12 @@ class LayaCrewRouter:
             model=self.model,
             max_len=self.max_len,
             head_max_len=self.head_max_len,
+            lang=self.lang,
+            min_confidence=self.min_confidence,
+            # `task` here is core's checkpoint selector, not the CrewAI task being decided on --
+            # `task_str` above is that one. Both are on this call, and only one routes.
+            task=self.task,
+            lang_guess=self.lang_guess,
             hooks=self.hooks,
             on_predict_start=self.on_predict_start,
             on_predict_end=self.on_predict_end,
@@ -305,9 +376,21 @@ class LayaCrewRouter:
         )
         self.last_decision = res
 
-        ans = res.get("answers", {}).get("delegation", {})
+        # The same nested-shape checks as the guardrail screen: `answers` must be an object,
+        # the answer must be an object, and `choice` is used with `.startswith` below -- a list
+        # there raised AttributeError out of a routing decision.
+        where = f"Laya server at {self.base_url}" if self.base_url else "Laya"
+        ans = _answers_map(res, where).get("delegation", {})
         chosen_key = ans.get("choice")
-        conf = ans.get("answer_confidence", ans.get("confidence", 1.0))
+        if chosen_key is not None and not isinstance(chosen_key, str):
+            raise _malformed(where, "'choice' must be a string, got %s" % type(chosen_key).__name__)
+        # Gate on the same number core's `flag_low_confidence` gates on: `answer_confidence`
+        # first, falling back to the entropy `confidence` so an answer that carries only the
+        # older field is still gated rather than silently passed (fail-closed). An answer with
+        # no usable number at all is treated as fully confident.
+        conf = _gate_confidence(ans)
+        if conf is None:
+            conf = 1.0
 
         # Map agent_i back to integer index i
         chosen_idx: int = 0
@@ -318,6 +401,16 @@ class LayaCrewRouter:
                 chosen_idx = 0
         elif chosen_key in criteria:
             chosen_idx = list(criteria.keys()).index(chosen_key)
+
+        # `chosen_key` is remote JSON and `agents` is the caller's list, so a two-agent crew can be
+        # told to delegate to `agent_9`: the parsed number indexes no agent and `agents[chosen_idx]`
+        # below raised a bare IndexError out of the routing decision, while `agent_-1` silently
+        # wrapped to the LAST agent. `criteria` is built from exactly these agents, so an index it
+        # does not name is a candidate that does not exist -- the same "unknown decision" that
+        # `tools.py:493` refuses by name rather than raising.
+        if not 0 <= chosen_idx < len(agents):
+            raise _malformed(where, "decision %r names agent %d, which is not in the %d-agent crew"
+                             % (chosen_key, chosen_idx, len(agents)))
 
         # Confidence gating
         if self.confidence_threshold > 0.0 and conf < self.confidence_threshold:
@@ -414,12 +507,18 @@ class LayaTaskGuard:
         model: Optional[str] = None,
         max_len: Optional[int] = None,
         head_max_len: Optional[int] = None,
+        lang: Optional[str] = None,
+        min_confidence: Optional[float] = None,
+        task: Optional[str] = None,
+        lang_guess: Optional[Any] = None,
         hooks: Optional[Any] = None,
         on_predict_start: Optional[Any] = None,
         on_predict_end: Optional[Any] = None,
         hooks_raise: Optional[bool] = None,
         hooks_timeout: Optional[float] = None,
     ):
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be a probability in [0, 1]; got %r" % (threshold,))
         self.questions = questions
         self.action = action
         self.rejection_message = rejection_message
@@ -430,6 +529,10 @@ class LayaTaskGuard:
         self.model = model
         self.max_len = max_len
         self.head_max_len = head_max_len
+        self.lang = lang
+        self.min_confidence = min_confidence
+        self.task = task
+        self.lang_guess = lang_guess
         self.hooks = hooks
         self.on_predict_start = on_predict_start
         self.on_predict_end = on_predict_end
@@ -455,6 +558,12 @@ class LayaTaskGuard:
             model=self.model,
             max_len=self.max_len,
             head_max_len=self.head_max_len,
+            lang=self.lang,
+            min_confidence=self.min_confidence,
+            # `task` here is core's checkpoint selector, not the CrewAI task being decided on --
+            # `task_str` above is that one. Both are on this call, and only one routes.
+            task=self.task,
+            lang_guess=self.lang_guess,
             hooks=self.hooks,
             on_predict_start=self.on_predict_start,
             on_predict_end=self.on_predict_end,
@@ -462,21 +571,35 @@ class LayaTaskGuard:
             hooks_timeout=self.hooks_timeout,
         )
         self.last_decision = res
-        answers = res.get("answers", {})
+        # A remote body is arbitrary JSON, so `answers` and each answer are checked before anything
+        # is read out of them: `res.get("answers", {})` only defaults when the key is absent, and a
+        # present-but-non-object value used to raise AttributeError/TypeError out of the one path
+        # whose job is to fail closed. A `noul` value is checked too (`>=` against a string or null
+        # is a TypeError, a bool reads as 1.0/0.0, NaN compares False i.e. "safe").
+        where = f"Laya server at {self.base_url}" if self.base_url else "Laya"
+        answers = _answers_map(res, where)
 
         violations: Dict[str, Any] = {}
         for qid, ans in answers.items():
             t = ans.get("type")
-            if t == "noul" and ans.get("noul", 0.0) >= self.threshold:
-                violations[qid] = {
-                    "probability": ans["noul"],
-                    "confidence": ans.get("confidence", 0.0),
-                }
-            elif t == "score" and ans.get("score", 0.0) >= self.threshold:
-                violations[qid] = {
-                    "score": ans["score"],
-                    "confidence": ans.get("confidence", 0.0),
-                }
+            if t == "noul":
+                probability = _answer_number(ans, "noul", where)
+                if probability >= self.threshold:
+                    violations[qid] = {
+                        "probability": probability,
+                        "confidence": ans.get("confidence", 0.0),
+                    }
+            elif t == "score":
+                # `score` is the expected level (0..k-1), not a probability: gate on the
+                # probability that the level is at or above the middle of the scale.
+                levels = len(qdefs.get(qid, {}).get("criteria") or [])
+                p_violation = _score_violation_probability(ans, levels)
+                if p_violation >= self.threshold:
+                    violations[qid] = {
+                        "score": ans.get("score", 0.0),
+                        "probability": round(p_violation, 4),
+                        "confidence": ans.get("confidence", 0.0),
+                    }
 
         is_safe = len(violations) == 0
 
