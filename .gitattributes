@@ -19,3 +19,6 @@ research/benchmarks/zh_short_commands/results/** text eol=lf
 # that rewrote the line endings would report every line as changed on the next re-run.
 laya-rust/tests/round4_python_cases.txt text eol=lf
 laya-dotnet/tests/Laya.Tests/golden/round4/round4_python.txt text eol=lf
+
+# cmd.exe misreads goto labels in LF batch files; core.autocrlf=input would otherwise strip the CR.
+src/*.bat text eol=crlf
