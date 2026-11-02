@@ -3,17 +3,22 @@
     python download_model.py                      # english + multilingual -> ./weights
     python download_model.py --models english,multilingual,typed-decisions
     python download_model.py --verify             # check an existing folder, no network
+    python download_model.py --check              # compare the folder with the Hub, no download
 
 Result (the layout `Router()` expects, relative to the folder you run from):
 
     weights/convaiinnovations/laya/
         rl_agent_config.json, model.safetensors, tokenizer/, encoder/
         multilingual/  (same four entries)
+        revisions.json  (the Hub commit each checkpoint was last verified against)
 
 Only `huggingface_hub` is needed, which `pip install laya` already brings in. Set HF_TOKEN
 for higher Hub rate limits.
 """
 import argparse
+import fnmatch
+import hashlib
+import json
 import os
 import sys
 
@@ -25,6 +30,7 @@ SUBFOLDERS = {"english": None, "multilingual": "multilingual", "typed-decisions"
 ARTIFACTS = ("rl_agent_config.json", "model.safetensors", "tokenizer/*", "encoder/*")
 REQUIRED = ("rl_agent_config.json", "model.safetensors", "tokenizer/tokenizer.json",
             "tokenizer/tokenizer_config.json", "encoder/config.json")
+REVISIONS_FILE = "revisions.json"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -36,6 +42,57 @@ def checkpoint_dir(out, model):
 def missing_files(out, models):
     return ["%s: %s" % (m, rel) for m in models for rel in REQUIRED
             if not os.path.exists(os.path.join(checkpoint_dir(out, m), *rel.split("/")))]
+
+
+def patterns_for(models):
+    # `fnmatch` anchors at the start of the path, so the root patterns do not pull in the
+    # subfolders of checkpoints nobody asked for.
+    patterns = []
+    for m in models:
+        prefix = SUBFOLDERS[m] + "/" if SUBFOLDERS[m] else ""
+        patterns += [prefix + a for a in ARTIFACTS]
+    return patterns
+
+
+def file_hash(path, algo, header=b""):
+    digest = hashlib.new(algo, header)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 ** 2), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def matches_hub(path, sibling):
+    """Whether the local file is byte-for-byte the one on the Hub, from the digest the Hub reports."""
+    if not os.path.isfile(path) or os.path.getsize(path) != sibling.size:
+        return False
+    if sibling.lfs:
+        return file_hash(path, "sha256") == sibling.lfs.sha256
+    # Files outside LFS only carry their git blob id, which is the SHA-1 of a header plus the bytes.
+    return file_hash(path, "sha1", b"blob %d\0" % sibling.size) == sibling.blob_id
+
+
+def stale_files(target, info, models):
+    """Hub files the requested checkpoints need that are absent or different under `target`."""
+    patterns = patterns_for(models)
+    return [s.rfilename for s in info.siblings
+            if any(fnmatch.fnmatch(s.rfilename, p) for p in patterns)
+            and not matches_hub(os.path.join(target, *s.rfilename.split("/")), s)]
+
+
+def read_revisions(target):
+    try:
+        with open(os.path.join(target, REVISIONS_FILE), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def record_revisions(target, models, sha):
+    revisions = read_revisions(target)
+    revisions.update({m: sha for m in models})
+    with open(os.path.join(target, REVISIONS_FILE), "w", encoding="utf-8") as f:
+        json.dump(revisions, f, indent=2, sort_keys=True)
 
 
 def folder_size(path):
@@ -50,6 +107,8 @@ def main():
                    help="comma list of %s" % "/".join(SUBFOLDERS))
     p.add_argument("--revision", help="commit SHA, branch or tag (default: latest)")
     p.add_argument("--verify", action="store_true", help="only check the folder; no download")
+    p.add_argument("--check", action="store_true",
+                   help="compare the folder with the Hub; no download, exit 1 if it is behind")
     args = p.parse_args()
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -58,19 +117,43 @@ def main():
         p.error("unknown or empty --models %s; choose from %s" % (bad, ", ".join(SUBFOLDERS)))
     out = os.path.abspath(args.out)
 
-    if not args.verify:
-        from huggingface_hub import snapshot_download
+    target = os.path.join(out, *REPO.split("/"))
+    token = os.environ.get("HF_TOKEN") or None
 
-        # One snapshot for all requested checkpoints. `fnmatch` anchors at the start of the path,
-        # so the root patterns do not pull in the subfolders of checkpoints nobody asked for.
-        patterns = []
-        for m in models:
-            prefix = SUBFOLDERS[m] + "/" if SUBFOLDERS[m] else ""
-            patterns += [prefix + a for a in ARTIFACTS]
-        target = os.path.join(out, *REPO.split("/"))
+    if not args.verify:
+        from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+
+        # Resolve "latest" to one commit up front, so every file below comes from the same
+        # snapshot even if the Hub moves mid-download, and carries the digests to compare with.
+        info = HfApi().model_info(REPO, revision=args.revision, files_metadata=True, token=token)
+        print("hub revision: %s%s" % (info.sha, " (requested)" if args.revision else " (latest)"))
+
+        if args.check:
+            stale = stale_files(target, info, models)
+            if stale:
+                print("\nBEHIND the Hub, run update_model.bat:")
+                for name in stale:
+                    print("  " + name)
+                return 1
+            print("\nUP TO DATE: %s match %s" % (", ".join(models), info.sha))
+            return 0
+
         print("downloading %s -> %s" % (", ".join(models), target))
-        snapshot_download(REPO, allow_patterns=patterns, local_dir=target,
-                          revision=args.revision, token=os.environ.get("HF_TOKEN") or None)
+        snapshot_download(REPO, allow_patterns=patterns_for(models), local_dir=target,
+                          revision=info.sha, token=token)
+        # snapshot_download trusts its own cache metadata and file times, so a local file changed
+        # behind its back can be skipped. Fetch again whatever does not match the Hub's digest.
+        for name in stale_files(target, info, models):
+            print("re-downloading " + name)
+            hf_hub_download(REPO, name, local_dir=target, revision=info.sha, token=token,
+                            force_download=True)
+        stale = stale_files(target, info, models)
+        if stale:
+            print("\nMISMATCH with the Hub:")
+            for name in stale:
+                print("  " + name)
+            return 1
+        record_revisions(target, models, info.sha)
 
     missing = missing_files(out, models)
     if missing:
@@ -79,6 +162,9 @@ def main():
             print("  " + item)
         return 1
     print("\nOK: %s in %s (%.1f GB)" % (", ".join(models), out, folder_size(out) / 1024 ** 3))
+    revisions = read_revisions(target)
+    for m in models:
+        print("  %s: revision %s" % (m, revisions.get(m, "unknown (run update_model.bat to record it)")))
     return 0
 
 
