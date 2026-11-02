@@ -5,8 +5,8 @@
 
 | ไฟล์ | หน้าที่ |
 |---|---|
-| `update_model.bat` | Windows: เตรียม `.venv` แล้วโหลด/อัปเดต model ล่าสุดมาไว้ที่ `weights/` (ต้องต่อเน็ต) |
-| `start_laya.bat` | Windows: start API gateway แบบ offline จาก `weights/` |
+| `update_model.bat` | Windows: build image `laya-gateway:latest` ใหม่ด้วย model ล่าสุด (ต้องต่อเน็ต) |
+| `start_laya.bat` | Windows: build image แล้วสร้าง container ใหม่ของ API gateway |
 | `download_model.py` | โหลด checkpoint มาไว้ที่ `weights/` (ต้องต่อเน็ต ทำครั้งเดียว) |
 | `test_download_model.py` | ทดสอบการเทียบไฟล์กับ Hub ของ `download_model.py` (ไม่ใช้เน็ต) |
 | `test_laya.py` | ทดสอบ laya — ใส่ `--weights weights` เพื่อรันแบบ offline |
@@ -25,45 +25,46 @@
 
 ## เริ่มเร็วบน Windows (ไฟล์ `.bat`)
 
-ดับเบิลคลิก หรือรันจาก `cmd` / PowerShell ก็ได้ ไม่ต้อง activate venv
+ต้องเปิด Docker Desktop ไว้ก่อน แล้วดับเบิลคลิก หรือรันจาก `cmd` / PowerShell ก็ได้
 
 ```bat
-update_model.bat      :: ครั้งแรก: สร้าง .venv + ติดตั้ง + โหลด model (ต้องต่อเน็ต)
-start_laya.bat        :: start gateway แบบ offline ที่ http://localhost:8080
+start_laya.bat        :: build image แล้วสร้าง container ใหม่ที่ http://localhost:8080
 start_laya.bat 9000   :: เลือก port เอง
+update_model.bat      :: build image อย่างเดียว ไม่ start
 ```
 
 ทดสอบว่าขึ้นแล้ว: `curl http://localhost:8080/health`
+หยุด: `docker compose -f compose.run.yaml down`
 
-**อัปเดต model:** รัน `update_model.bat` ซ้ำได้เลย สคริปต์เทียบกับ revision ล่าสุดบน Hub และโหลดเฉพาะไฟล์ที่เปลี่ยน
-ถ้าไม่มีอะไรเปลี่ยนจะจบในไม่กี่วินาที
+gateway รันอยู่เบื้องหลังหลังจากปิดหน้าต่าง และขึ้นเองเมื่อ Docker เริ่มใหม่ จนกว่าจะสั่งหยุด
 
-สคริปต์ยืนยันทุกไฟล์ด้วย hash เทียบกับ revision ล่าสุดบน Hub ไฟล์ไหนไม่ตรงจะโหลดใหม่ แล้วบันทึก commit ไว้ที่
-`weights/convaiinnovations/laya/revisions.json`
+**ทุกครั้งที่รัน `start_laya.bat`:** อ่าน revision ล่าสุดจาก Hub, build image, แล้วแทนที่ container เดิมด้วยตัวใหม่
+ส่วนที่ไม่เปลี่ยนใช้ cache ของ Docker จึงไม่โหลดซ้ำ ครั้งแรกหรือเมื่อ model เปลี่ยนจะโหลดราว 1.4 GB
+model อยู่ใน image ไม่ได้อ่านจาก `weights/`
 
-`start_laya.bat` โหลด model จาก `weights/` เท่านั้น ไม่ต่อเน็ต จึงได้ model ล่าสุด **ณ ตอนที่รัน `update_model.bat` ครั้งท้าย**
-ถ้าต้องการให้เช็คก่อน start ทุกครั้ง (เครื่องต้องมีเน็ต):
+ถ้าติดต่อ Hub ไม่ได้ หรือไม่มี `compose.yaml` ข้าง ๆ จะไม่ build และ start จาก image ที่มีอยู่พร้อมขึ้นคำเตือน
+ซึ่งอาจไม่ใช่ model ล่าสุด
+
+`laya` ถูก pin เวอร์ชันไว้ใน `requirements.txt` เวลามี release ใหม่ต้องแก้เลขเวอร์ชันในไฟล์ก่อน
+
+**เอา image ไปใช้เครื่องอื่น:**
 
 ```bat
-set LAYA_CHECK_LATEST=1
+docker save -o laya-gateway.tar laya-gateway:latest
+```
+
+คัดลอก `laya-gateway.tar`, `compose.run.yaml` และ `start_laya.bat` ไปไว้โฟลเดอร์เดียวกันที่ปลายทาง แล้ว:
+
+```bat
+docker load -i laya-gateway.tar
 start_laya.bat
 ```
 
-ถ้าไฟล์ไม่ตรงกับ Hub หรือติดต่อ Hub ไม่ได้ จะไม่ยอม start หรือเช็คอย่างเดียวด้วย
-`.venv\Scripts\python download_model.py --check` (ไม่โหลดอะไร, exit code 1 ถ้าไม่ล่าสุด)
+ตั้งค่าได้ด้วย environment หรือไฟล์ `.env` ตามหัวไฟล์ `compose.run.yaml` เช่น `LAYA_API_KEY`, `LAYA_BIND_ADDRESS`
+(default `127.0.0.1` เครื่องนี้เท่านั้น ถ้าเปิดให้เครื่องอื่นเรียกด้วย `0.0.0.0` ให้ตั้ง `LAYA_API_KEY` ด้วย)
 
-- ปิด gateway ก่อนอัปเดต เพราะ Windows ล็อกไฟล์ model ที่โหลดอยู่ แล้วค่อย start ใหม่เพื่อใช้ไฟล์ใหม่
-- `update_model.bat` รับ option เดียวกับ `download_model.py` เช่น `--revision <commit-sha>` หรือ
-  `--models english,multilingual,typed-decisions` ถ้าใช้ `typed-decisions` ต้องใส่ `--models` ทุกครั้งที่อัปเดต
-  เพราะ default อัปเดตแค่ `english,multilingual`
-- `update_model.bat` ติดตั้ง package ตาม `requirements.txt` ด้วยทุกครั้ง แต่ `laya` ถูก pin เวอร์ชันไว้ในไฟล์นั้น
-  เวลามี release ใหม่ต้องแก้เลขเวอร์ชันในไฟล์ก่อน แล้วค่อยรันสคริปต์
-
-`start_laya.bat` ตั้ง `HF_HUB_OFFLINE=1` ให้เอง และเช็คไฟล์ใน `weights/` ก่อน start ถ้าขาดจะบอกเป็นรายไฟล์
-ตั้งค่าเพิ่มได้ด้วยตัวแปรใน[ข้อ 6](#6-api-gateway-apppy) รวมถึง `LAYA_PORT` และ `LAYA_BIND_ADDRESS` (default `127.0.0.1`
-เครื่องนี้เท่านั้น ถ้าเปิดให้เครื่องอื่นเรียกด้วย `0.0.0.0` ให้ตั้ง `LAYA_API_KEY` ด้วย)
-
-เครื่องที่ไม่มีเน็ตเลย ดู[ข้อ 5](#5-ย้ายไปเครื่องที่ไม่มีเน็ตเลย)
+ถ้าไม่ใช้ Docker ให้ทำตามข้อ 1–6 ด้านล่าง ซึ่งใช้ `download_model.py` โหลด model มาไว้ที่ `weights/`
+และเทียบกับ Hub ได้ด้วย `.venv\Scripts\python download_model.py --check`
 
 ---
 
@@ -196,7 +197,7 @@ python -m venv .venv
 .venv/Scripts/python test_laya.py --weights weights
 ```
 
-จากนั้น start gateway ด้วย `start_laya.bat` ได้เลย (อย่ารัน `update_model.bat` บนเครื่องนี้ เพราะต้องใช้เน็ต)
+ถ้าจะรัน gateway ด้วย ดูคำสั่งใน[ข้อ 6](#6-api-gateway-apppy) ถ้าปลายทางมี Docker การย้าย image ตามหัวข้อด้านบนจะง่ายกว่า
 
 ## 6. API gateway (`app.py`)
 
@@ -247,7 +248,7 @@ docker run -d --name laya-gateway -p 8080:8080 -e LAYA_API_KEY=changeme laya-gat
   `docker load` ที่ปลายทาง ไม่ต้องเตรียม `weights/` แยก
 
 > Docker เก็บ layer ที่โหลด model ไว้ใน cache ถ้า build ซ้ำเฉย ๆ อาจได้ model เดิม
-> ถ้าต้องการ model ล่าสุดให้ใช้ `docker compose build --no-cache`
+> ถ้าต้องการ model ล่าสุดให้ใช้ `update_model.bat` ซึ่งส่ง revision ล่าสุดเข้า build
 
 ### รันด้วย Docker Compose (`compose.yaml`)
 

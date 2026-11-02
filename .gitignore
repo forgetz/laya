@@ -96,6 +96,9 @@ site/
 .ruff_cache/
 research/*_benchmark_results.json
 
+# gateway images exported with docker save (see src/README.md)
+src/*.tar
+
 # local checkpoint weights, kept out of the tree
 # (fetch them with: python verify/checkpoints.py --fetch)
 models/
